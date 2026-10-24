@@ -6,7 +6,12 @@ const media = document.getElementById("media");
 api.storage.local.get("enabled").then(({ enabled = true }) => { box.checked = enabled; });
 box.addEventListener("change", () => api.storage.local.set({ enabled: box.checked }));
 
-fetch("http://127.0.0.1:9614/ping")
+const overlay = document.getElementById("overlay");
+api.storage.local.get("overlay").then(({ overlay: on = true }) => { overlay.checked = on !== false; });
+overlay.addEventListener("change", () => api.storage.local.set({ overlay: overlay.checked }));
+
+api.storage.local.get("bridgePort")
+  .then(({ bridgePort = 9614 }) => fetch(`http://127.0.0.1:${bridgePort}/ping`))
   .then(r => r.json())
   .then(j => { state.textContent = j.app === "kilatdl" ? "KilatDL berjalan" : "Respon tidak dikenal"; })
   .catch(() => { state.textContent = "KilatDL tidak berjalan - unduhan tetap oleh browser"; });

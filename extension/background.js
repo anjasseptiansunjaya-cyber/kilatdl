@@ -1,5 +1,7 @@
 const api = globalThis.browser ?? globalThis.chrome;
-const BRIDGE = "http://127.0.0.1:9614";
+const DEFAULT_PORT = 9614;
+// the port can be changed with storage.local.bridgePort (used by the automated tests)
+const bridge = async () => `http://127.0.0.1:${(await api.storage.local.get("bridgePort")).bridgePort || DEFAULT_PORT}`;
 const MIN_BYTES = 1 << 20;      // leave tiny files to the browser
 const MIN_MEDIA_BYTES = 300e3;  // ignore ad stings and tiny probe requests
 const MEDIA_EXT = /\.(mp4|webm|mkv|mov|m4v|mp3|m4a|aac|ogg|opus|flac|wav)$/i;
@@ -79,7 +81,7 @@ async function send(url, referrer, name) {
     if (cookies.length) headers.Cookie = cookies.map(c => `${c.name}=${c.value}`).join("; ");
   } catch (_) { /* no cookie access for this URL */ }
   try {
-    const r = await fetch(`${BRIDGE}/add`, {
+    const r = await fetch(`${await bridge()}/add`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-KilatDL": "1" },
       body: JSON.stringify({ url, headers, name }),
@@ -117,13 +119,17 @@ api.contextMenus.onClicked.addListener(async (info, tab) => {
 });
 
 // popup <-> background: list what was detected in a tab, or send one item to KilatDL
-api.runtime.onMessage.addListener((msg, _sender, reply) => {
+api.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (sender.id !== api.runtime.id) return false;
+  const tabId = msg.tabId ?? (sender.tab && sender.tab.id); // content scripts do not know their tab id
   if (msg.cmd === "list") {
-    ready.then(() => reply([...(found.get(msg.tabId) || new Map()).values()]));
+    ready.then(() => reply([...(found.get(tabId) || new Map()).values()]));
   } else if (msg.cmd === "download") {
-    ready.then(() => api.tabs.get(msg.tabId)).then(tab => {
-      const item = (found.get(msg.tabId) || new Map()).get(msg.url);
-      return send(msg.url, tab.url, fileName(tab.title, item ? item.ext : ""));
+    ready.then(() => api.tabs.get(tabId)).then(tab => {
+      const item = (found.get(tabId) || new Map()).get(msg.url);
+      let ext = item ? item.ext : "";
+      if (!item) { try { ext = (new URL(msg.url).pathname.match(MEDIA_EXT) || [""])[0]; } catch (_) { /* keep empty */ } }
+      return send(msg.url, tab.url, fileName(tab.title, ext));
     }).then(ok => reply(ok), () => reply(false));
   } else {
     return false;

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "KilatDL Integration",
-  "version": "1.1",
-  "description": "Kirim unduhan dan video browser ke KilatDL (multi-koneksi).",
+  "version": "1.2",
+  "description": "Kirim unduhan dan video browser ke KilatDL, dengan tombol unduh di atas pemutar video.",
   "permissions": [
     "downloads",
     "cookies",
@@ -35,5 +35,18 @@
         ]
       }
     }
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ]
 }

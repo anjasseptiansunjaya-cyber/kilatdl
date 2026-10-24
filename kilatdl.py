@@ -693,13 +693,49 @@ def start_bridge(on_add):
 def run_gui(urls, background=False):
     import gi
     gi.require_version("Gtk", "4.0")
-    from gi.repository import Gio, GLib, Gtk, Pango
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
+
+    CSS = b"""
+    .dl-card { padding: 14px 16px; border-radius: 16px; background: @card_bg_color;
+               box-shadow: 0 0 0 1px alpha(@borders, .6), 0 1px 3px alpha(black, .08); }
+    .dl-icon { background: alpha(@accent_bg_color, .14); color: @accent_color; border-radius: 12px;
+               min-width: 46px; min-height: 46px; }
+    .dl-done .dl-icon { background: alpha(@success_bg_color, .16); color: @success_color; }
+    .dl-error .dl-icon { background: alpha(@error_bg_color, .16); color: @error_color; }
+    .dl-title { font-weight: 700; font-size: 1.02em; }
+    .dl-info { font-size: 0.88em; opacity: .72; }
+    .dl-error .dl-info { color: @error_color; opacity: 1; }
+    .dl-card progressbar > trough, .dl-card progressbar > trough > progress { min-height: 6px; border-radius: 3px; }
+    .dl-done progressbar > trough > progress { background: @success_bg_color; }
+    .dl-error progressbar > trough > progress { background: @error_bg_color; }
+    .statusbar { padding: 8px 18px; font-size: 0.9em; opacity: .8; }
+    """
+    ICONS = (
+        (("mp4", "mkv", "webm", "mov", "m4v", "ts", "avi"), "video-x-generic-symbolic"),
+        (("mp3", "m4a", "aac", "ogg", "opus", "flac", "wav"), "audio-x-generic-symbolic"),
+        (("zip", "rar", "7z", "tar", "gz", "xz", "bz2", "iso", "img", "dmg"), "package-x-generic-symbolic"),
+        (("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "txt", "epub"), "x-office-document-symbolic"),
+        (("exe", "msi", "deb", "rpm", "appimage", "apk", "sh"), "application-x-executable-symbolic"),
+        (("jpg", "jpeg", "png", "gif", "webp", "svg"), "image-x-generic-symbolic"),
+    )
+
+    def icon_for(name):
+        ext = os.path.splitext(name or "")[1].lstrip(".").lower()
+        return next((icon for exts, icon in ICONS if ext in exts), "folder-download-symbolic")
 
     def open_path(path):
         try:
             Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path), None)
         except GLib.Error:
             pass  # no handler for this file type
+
+    def icon_button(icon, tip, callback, *css):
+        b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER)
+        for c in ("flat", "circular") + css:
+            b.add_css_class(c)
+        b.connect("clicked", callback)
+        return b
 
     settings = load_settings()
     mgr = Manager(settings["parallel"])
@@ -708,32 +744,33 @@ def run_gui(urls, background=False):
 
     class Row(Gtk.Box):
         def __init__(self, dl, win):
-            super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            super().__init__(spacing=14)
             self.dl, self.win = dl, win
-            for side in ("top", "bottom", "start", "end"):
-                getattr(self, f"set_margin_{side}")(8)
+            self.add_css_class("dl-card")
+            self.icon = Gtk.Image(icon_name=icon_for(dl.name or dl.url), pixel_size=22, halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+            frame = Gtk.Box(valign=Gtk.Align.CENTER, halign=Gtk.Align.START, hexpand=False)
+            frame.set_size_request(46, 46)
+            frame.add_css_class("dl-icon")
+            frame.append(self.icon)
+            self.icon.set_hexpand(True)
             self.title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+            self.title.add_css_class("dl-title")
             self.bar = Gtk.ProgressBar()
             self.info = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
-            self.info.add_css_class("dim-label")
-            btns = Gtk.Box(spacing=6)
-            self.toggle = Gtk.Button(label="Jeda")
-            self.toggle.connect("clicked", self.on_toggle)
-            self.open_btn = Gtk.Button(label="Buka file")
-            self.open_btn.connect("clicked", lambda *_: open_path(self.dl.path))
-            folder = Gtk.Button(label="Buka folder")
-            folder.connect("clicked", self.on_folder)
-            self.link_btn = Gtk.Button(label="Ganti link")
-            self.link_btn.set_tooltip_text("Link kedaluwarsa? Tempel link baru, progres tetap dilanjutkan")
-            self.link_btn.connect("clicked", self.on_link)
-            self.sum_btn = Gtk.Button(label="Checksum")
-            self.sum_btn.connect("clicked", self.on_checksum)
-            rm = Gtk.Button(label="Hapus")
-            rm.add_css_class("destructive-action")
-            rm.connect("clicked", self.on_remove)
-            for b in (self.toggle, self.open_btn, folder, self.link_btn, self.sum_btn, rm):
-                btns.append(b)
-            for w in (self.title, self.bar, self.info, btns):
+            self.info.add_css_class("dl-info")
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True, valign=Gtk.Align.CENTER)
+            for w in (self.title, self.bar, self.info):
+                text.append(w)
+            self.toggle = icon_button("media-playback-pause-symbolic", "Jeda", self.on_toggle)
+            self.open_btn = icon_button("document-open-symbolic", "Buka file", lambda *_: open_path(self.dl.path))
+            self.folder_btn = icon_button("folder-open-symbolic", "Buka folder", self.on_folder)
+            self.link_btn = icon_button("insert-link-symbolic", "Ganti link (kalau link kedaluwarsa)", self.on_link)
+            self.sum_btn = icon_button("object-select-symbolic", "Verifikasi checksum", self.on_checksum)
+            self.rm_btn = icon_button("user-trash-symbolic", "Hapus dari daftar", self.on_remove)
+            actions = Gtk.Box(spacing=2, valign=Gtk.Align.CENTER)
+            for b in (self.toggle, self.open_btn, self.folder_btn, self.link_btn, self.sum_btn, self.rm_btn):
+                actions.append(b)
+            for w in (frame, text, actions):
                 self.append(w)
             self.refresh()
 
@@ -760,7 +797,7 @@ def run_gui(urls, background=False):
                         GLib.idle_add(done, str(e))
                 threading.Thread(target=work, daemon=True).start()
 
-            self.win.prompt("Ganti link", "Tempel link baru untuk file ini (ukurannya harus sama):", "https://...", apply)
+            self.win.prompt("Ganti link", "Alamat baru (URL)", "Ukuran file harus sama dengan yang lama. Progres dilanjutkan.", apply)
 
         def on_checksum(self, _):
             def apply(text, done):
@@ -770,11 +807,11 @@ def run_gui(urls, background=False):
                 except ValueError as e:
                     done(str(e))
 
-            self.win.prompt("Checksum", "Tempel hash dari situs (MD5/SHA-1/SHA-256/SHA-512), kosongkan untuk menghapus:",
-                            "sha256:...", apply)
+            self.win.prompt("Verifikasi checksum", "sha256:... (MD5, SHA-1, SHA-256 atau SHA-512)",
+                            "Tempel hash dari situs unduhan. Kosongkan untuk menghapus.", apply)
 
         def on_folder(self, _):
-            Gtk.show_uri(self.win, GLib.filename_to_uri(self.dl.directory), 0)
+            open_path(self.dl.directory)
 
         def on_remove(self, _):
             mgr.remove(self.dl)
@@ -784,53 +821,113 @@ def run_gui(urls, background=False):
             d = self.dl
             d.tick()
             self.title.set_text(d.name or d.url)
+            self.icon.set_from_icon_name(icon_for(d.name or d.url))
             self.bar.set_fraction(d.fraction if d.status != "done" else 1.0)
             self.info.set_text(status_text(d))
-            self.toggle.set_label({"downloading": "Jeda", "queued": "Batal antri", "done": "Selesai"}.get(d.status, "Lanjut"))
-            self.toggle.set_sensitive(d.status != "done")
+            for state in ("dl-done", "dl-error"):
+                self.remove_css_class(state)
+            if d.status == "done" and d.verify != "bad":
+                self.add_css_class("dl-done")
+            elif d.status == "error" or d.verify == "bad":
+                self.add_css_class("dl-error")
+            icon, tip = {"downloading": ("media-playback-pause-symbolic", "Jeda"),
+                         "queued": ("media-playback-stop-symbolic", "Batal antri")}.get(
+                d.status, ("media-playback-start-symbolic", "Lanjut"))
+            self.toggle.set_icon_name(icon)
+            self.toggle.set_tooltip_text(tip)
+            self.toggle.set_visible(d.status != "done")
             self.open_btn.set_visible(d.status == "done")
             self.link_btn.set_visible(d.status in ("paused", "error", "cancelled", "queued") and not d.hls)
-            self.sum_btn.set_visible(d.status == "done" or d.checksum is not None or d.status == "downloading")
+            self.sum_btn.set_visible(d.status in ("done", "downloading") or d.checksum is not None)
 
-    class Window(Gtk.ApplicationWindow):
+    class Window(Adw.ApplicationWindow):
         def __init__(self, app):
-            super().__init__(application=app, title="KilatDL", default_width=620, default_height=520)
-            add = Gtk.Button(label="+ Tambah URL")
+            super().__init__(application=app, title="KilatDL", default_width=760, default_height=640)
+            self.filter = "all"
+            self.rows = {}
+            if os.environ.get("KILATDL_SCHEME") == "dark":  # test hook for screenshots
+                Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_DARK)
+
+            add = Gtk.Button(child=Adw.ButtonContent(label="Tambah", icon_name="list-add-symbolic"))
             add.add_css_class("suggested-action")
+            add.set_tooltip_text("Tambah unduhan (Ctrl+N)")
             add.connect("clicked", lambda *_: self.ask_url())
-            header = Gtk.HeaderBar()
+
+            tabs = Gtk.Box(css_classes=["linked"])
+            first = None
+            for key, label in (("all", "Semua"), ("active", "Aktif"), ("done", "Selesai")):
+                b = Gtk.ToggleButton(label=label, active=key == "all")
+                if first:
+                    b.set_group(first)
+                first = first or b
+                b.connect("toggled", self.on_filter, key)
+                tabs.append(b)
+
+            header = Adw.HeaderBar(title_widget=tabs)
             header.pack_start(add)
+            header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", popover=self.build_menu(app), tooltip_text="Pengaturan"))
+
+            self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
+                                margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
+            scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+            scroll.set_child(Adw.Clamp(maximum_size=820, tightening_threshold=620, child=self.list))
+
+            empty = Adw.StatusPage(icon_name="folder-download-symbolic", title="Belum ada unduhan",
+                                   description="Tempel link dengan Ctrl+V, tarik tautan ke jendela ini,\natau klik Tambah.")
+            self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+            self.stack.add_named(empty, "empty")
+            self.stack.add_named(scroll, "list")
+
+            self.stats = Gtk.Label(xalign=0, hexpand=True)
+            self.stats.add_css_class("statusbar")
+
+            view = Adw.ToolbarView()
+            view.add_top_bar(header)
+            view.set_content(self.stack)
+            view.add_bottom_bar(self.stats)
+            self.toasts = Adw.ToastOverlay(child=view)
+            self.set_content(self.toasts)
+
+            drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.COPY)
+            drop.connect("drop", lambda _t, value, _x, _y: self.add_text(value) > 0)
+            self.add_controller(drop)
+            keys = Gtk.EventControllerKey()
+            keys.connect("key-pressed", self.on_key)
+            self.add_controller(keys)
+
+            self.connect("close-request", lambda *_: (self.set_visible(False), True)[1])
+            self.rebuild()
+            GLib.timeout_add(500, self.tick)
+            if os.environ.get("KILATDL_SCREENSHOT"):  # test hook: render the window to a PNG, then quit
+                GLib.timeout_add(2500, self.snapshot)
+
+        # -- settings menu ---------------------------------------------------
+        def build_menu(self, app):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=12,
+                          margin_start=12, margin_end=12)
+            box.set_size_request(280, -1)
+            limit = Gtk.SpinButton.new_with_range(0, 1_000_000, 100)
+            limit.set_value(settings["limit_kbps"])
+            limit.connect("value-changed", self.on_limit)
+            row = Gtk.Box(spacing=8)
+            row.append(Gtk.Label(label="Batas kecepatan (KB/s)", xalign=0, hexpand=True))
+            row.append(limit)
+            hint = Gtk.Label(label="0 = tanpa batas", xalign=0)
+            hint.add_css_class("dim-label")
             self.folder_btn = Gtk.Button()
             self.folder_btn.connect("clicked", lambda *_: self.pick_folder(self.set_default_dir))
             self.show_default_dir()
-            header.pack_start(self.folder_btn)
-            quit_btn = Gtk.Button(label="Keluar")
+            quit_btn = Gtk.Button(label="Keluar dari KilatDL")
+            quit_btn.add_css_class("destructive-action")
             quit_btn.connect("clicked", lambda *_: app.quit())
-            header.pack_end(quit_btn)
-            limit = Gtk.SpinButton.new_with_range(0, 1_000_000, 100)
-            limit.set_value(settings["limit_kbps"])
-            limit.set_tooltip_text("Batas kecepatan total dalam KB/s (0 = tanpa batas)")
-            limit.connect("value-changed", self.on_limit)
-            header.pack_end(limit)
-            header.pack_end(Gtk.Label(label="Batas KB/s"))
-            self.set_titlebar(header)
-            self.connect("close-request", lambda *_: (self.set_visible(False), True)[1])
-            self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            self.empty = Gtk.Label(label="Belum ada unduhan.\nKlik '+ Tambah URL' atau tempel tautan.", justify=Gtk.Justification.CENTER)
-            self.empty.set_vexpand(True)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            box.append(self.empty)
-            scroll = Gtk.ScrolledWindow(vexpand=True)
-            scroll.set_child(self.list)
-            box.append(scroll)
-            self.set_child(box)
-            self.rows = {}
-            self.rebuild()
-            GLib.timeout_add(500, self.tick)
+            for w in (row, hint, Gtk.Separator(), Gtk.Label(label="Folder tujuan", xalign=0), self.folder_btn,
+                      Gtk.Separator(), quit_btn):
+                box.append(w)
+            return Gtk.Popover(child=box)
 
         def show_default_dir(self):
-            self.folder_btn.set_label("Simpan ke: " + os.path.basename(settings["directory"].rstrip("/")) or "/")
-            self.folder_btn.set_tooltip_text(settings["directory"])
+            self.folder_btn.set_label(settings["directory"])
+            self.folder_btn.set_tooltip_text("Ubah folder tujuan bawaan")
 
         def set_default_dir(self, path):
             settings["directory"] = path
@@ -854,6 +951,19 @@ def run_gui(urls, background=False):
 
             dialog.select_folder(self, None, done)
 
+        # -- list ------------------------------------------------------------
+        def on_filter(self, button, key):
+            if button.get_active():
+                self.filter = key
+                self.rebuild()
+
+        def visible_items(self):
+            if self.filter == "done":
+                return [d for d in mgr.items if d.status == "done"]
+            if self.filter == "active":
+                return [d for d in mgr.items if d.status != "done"]
+            return list(mgr.items)
+
         def rebuild(self):
             self.rows.clear()
             child = self.list.get_first_child()
@@ -861,24 +971,135 @@ def run_gui(urls, background=False):
                 nxt = child.get_next_sibling()
                 self.list.remove(child)
                 child = nxt
-            for d in mgr.items:
+            for d in reversed(self.visible_items()):  # newest first
                 row = Row(d, self)
                 self.rows[d] = row
                 self.list.append(row)
-                self.list.append(Gtk.Separator())
-            self.empty.set_visible(not mgr.items)
+            self.stack.set_visible_child_name("list" if self.rows else "empty")
             mgr.save()
 
-        def prompt(self, title, label, placeholder, apply):
-            """Small text-entry dialog. apply(text, done) must call done(None) on success or done(message)."""
-            dlg = Gtk.Window(title=title, transient_for=self, modal=True, default_width=460)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            for side in ("top", "bottom", "start", "end"):
-                getattr(box, f"set_margin_{side}")(12)
-            entry = Gtk.Entry(placeholder_text=placeholder, hexpand=True)
+        def tick(self):
+            self.notify_finished()
+            mgr.schedule()
+            for r in self.rows.values():
+                r.refresh()
+            active = [d for d in mgr.items if d.status == "downloading"]
+            queued = sum(d.status == "queued" for d in mgr.items)
+            done = sum(d.status == "done" for d in mgr.items)
+            parts = [f"{len(active)} aktif"] + ([f"{queued} antri"] if queued else []) + [f"{done} selesai"]
+            if active:
+                parts.append("↓ " + human(sum(d.speed for d in active), "/s"))
+            if settings["limit_kbps"]:
+                parts.append(f"batas {settings['limit_kbps']} KB/s")
+            self.stats.set_text("  •  ".join(parts))
+            if int(time.time()) % 5 == 0:
+                mgr.save()
+            return True
+
+        # -- adding ----------------------------------------------------------
+        def add_url(self, url, directory=None, headers=None, name=None, checksum=None):
+            url = url.strip()
+            if not re.match(r"https?://", url):
+                return False
+            dl = Download(url, directory or settings["directory"], name=name, headers=headers)
+            if checksum:
+                dl.set_checksum(checksum)
+            mgr.add(dl)
+            self.rebuild()
+            self.toasts.add_toast(Adw.Toast.new("Unduhan ditambahkan"))
+            return True
+
+        def add_text(self, text):
+            found = re.findall(r"https?://[^\s\"'<>]+", text or "")
+            return sum(self.add_url(u) for u in found)
+
+        def on_key(self, _ctl, keyval, _code, state):
+            ctrl = state & Gdk.ModifierType.CONTROL_MASK
+            if ctrl and keyval == Gdk.KEY_v:
+                def got(clip, res):
+                    try:
+                        text = clip.read_text_finish(res) or ""
+                    except GLib.Error:
+                        return
+                    if not self.add_text(text):
+                        self.toasts.add_toast(Adw.Toast.new("Tidak ada link di clipboard"))
+                self.get_clipboard().read_text_async(None, got)
+                return True
+            if ctrl and keyval == Gdk.KEY_n:
+                self.ask_url()
+                return True
+            return False
+
+        def ask_url(self):
+            dlg = Adw.Dialog(title="Tambah unduhan", content_width=480)
+            group = Adw.PreferencesGroup()
+            url = Adw.EntryRow(title="Alamat file (URL)")
+            checksum = Adw.EntryRow(title="Checksum (opsional) sha256:... / md5 / sha1")
+            chosen = [settings["directory"]]
+            where = Adw.ActionRow(title="Simpan ke", subtitle=chosen[0])
+            change = Gtk.Button(label="Ubah", valign=Gtk.Align.CENTER)
+            where.add_suffix(change)
+
+            def picked(path):
+                chosen[0] = path
+                where.set_subtitle(path)
+
+            change.connect("clicked", lambda *_: self.pick_folder(picked, chosen[0]))
+            for row in (url, where, checksum):
+                group.add(row)
             msg = Gtk.Label(xalign=0, wrap=True)
-            ok = Gtk.Button(label="OK")
+            msg.add_css_class("error")
+            ok = Gtk.Button(label="Unduh", halign=Gtk.Align.END)
             ok.add_css_class("suggested-action")
+            ok.add_css_class("pill")
+
+            def submit(*_):
+                try:
+                    if checksum.get_text().strip():
+                        parse_checksum(checksum.get_text())
+                except ValueError as e:
+                    msg.set_text(str(e))
+                    return
+                if self.add_url(url.get_text(), chosen[0], checksum=checksum.get_text()):
+                    dlg.close()
+                else:
+                    msg.set_text("URL harus diawali http:// atau https://")
+
+            url.connect("entry-activated", submit)
+            checksum.connect("entry-activated", submit)
+            ok.connect("clicked", submit)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=16,
+                           margin_start=16, margin_end=16)
+            for w in (group, msg, ok):
+                body.append(w)
+            view = Adw.ToolbarView()
+            view.add_top_bar(Adw.HeaderBar())
+            view.set_content(body)
+            dlg.set_child(view)
+
+            def got(clip, res):
+                try:
+                    text = (clip.read_text_finish(res) or "").strip()
+                    if re.match(r"https?://", text) and not url.get_text():
+                        url.set_text(text)
+                except GLib.Error:
+                    pass
+
+            self.get_clipboard().read_text_async(None, got)
+            dlg.present(self)
+            url.grab_focus()
+
+        def prompt(self, title, label, hint, apply):
+            """Single-field dialog. apply(text, done) must call done(None) on success or done(message)."""
+            dlg = Adw.Dialog(title=title, content_width=460)
+            entry = Adw.EntryRow(title=label)
+            group = Adw.PreferencesGroup(description=hint)
+            group.add(entry)
+            msg = Gtk.Label(xalign=0, wrap=True)
+            msg.add_css_class("error")
+            ok = Gtk.Button(label="OK", halign=Gtk.Align.END)
+            ok.add_css_class("suggested-action")
+            ok.add_css_class("pill")
 
             def done(error):
                 ok.set_sensitive(True)
@@ -889,13 +1110,20 @@ def run_gui(urls, background=False):
                 msg.set_text("")
                 apply(entry.get_text(), done)
 
-            entry.connect("activate", submit)
+            entry.connect("entry-activated", submit)
             ok.connect("clicked", submit)
-            for w in (Gtk.Label(label=label, xalign=0, wrap=True), entry, msg, ok):
-                box.append(w)
-            dlg.set_child(box)
-            dlg.present()
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=16,
+                           margin_start=16, margin_end=16)
+            for w in (group, msg, ok):
+                body.append(w)
+            view = Adw.ToolbarView()
+            view.add_top_bar(Adw.HeaderBar())
+            view.set_content(body)
+            dlg.set_child(view)
+            dlg.present(self)
+            entry.grab_focus()
 
+        # -- notifications ---------------------------------------------------
         def notify_finished(self):
             app = self.get_application()
             for d in mgr.items:
@@ -919,75 +1147,33 @@ def run_gui(urls, background=False):
                     note.set_default_action_and_target("app.open-folder", GLib.Variant("s", os.path.dirname(d.path)))
                 app.send_notification(f"kilatdl-{id(d)}", note)
 
-        def tick(self):
-            self.notify_finished()
-            mgr.schedule()
-            for r in self.rows.values():
-                r.refresh()
-            mgr.save() if int(time.time()) % 5 == 0 else None
-            return True
+        def snapshot(self):
+            """Test hook (KILATDL_SCREENSHOT=file.png): save what the window shows, then quit."""
+            gi.require_version("Graphene", "1.0")
+            from gi.repository import Graphene
+            content = self.get_content()
+            w, h = content.get_width(), content.get_height()
+            inner = Gtk.Snapshot()
+            Gtk.WidgetPaintable.new(content).snapshot(inner, w, h)
+            node = inner.to_node()
+            self.snap_tries = getattr(self, "snap_tries", 0) + 1
+            if node is None:  # first frame not drawn yet
+                if self.snap_tries < 8:
+                    self.present()
+                    content.queue_draw()
+                    return True
+                print("snapshot: nothing rendered", file=sys.stderr)
+            else:
+                dark = Adw.StyleManager.get_default().get_dark()  # the window background is not part of the content
+                outer = Gtk.Snapshot()
+                outer.append_color(Gdk.RGBA(*((0.14, 0.14, 0.14, 1) if dark else (0.98, 0.98, 0.98, 1))),
+                                   Graphene.Rect().init(0, 0, w, h))
+                outer.append_node(node)
+                self.get_native().get_renderer().render_texture(outer.to_node(), None).save_to_png(os.environ["KILATDL_SCREENSHOT"])
+            self.get_application().quit()
+            return False
 
-        def add_url(self, url, directory=None, headers=None, name=None, checksum=None):
-            url = url.strip()
-            if not re.match(r"https?://", url):
-                return False
-            dl = Download(url, directory or settings["directory"], name=name, headers=headers)
-            if checksum:
-                dl.set_checksum(checksum)
-            mgr.add(dl)
-            self.rebuild()
-            return True
-
-        def ask_url(self):
-            dlg = Gtk.Window(title="Tambah unduhan", transient_for=self, modal=True, default_width=460)
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-            for side in ("top", "bottom", "start", "end"):
-                getattr(box, f"set_margin_{side}")(12)
-            entry = Gtk.Entry(placeholder_text="https://contoh.com/file.zip", hexpand=True)
-            msg = Gtk.Label(xalign=0)
-            chosen = [settings["directory"]]
-            where = Gtk.Button(label="Folder: " + chosen[0])
-
-            def picked(path):
-                chosen[0] = path
-                where.set_label("Folder: " + path)
-
-            where.connect("clicked", lambda *_: self.pick_folder(picked, chosen[0]))
-            checksum = Gtk.Entry(placeholder_text="Checksum (opsional) sha256:... / md5 / sha1", hexpand=True)
-            ok = Gtk.Button(label="Unduh")
-            ok.add_css_class("suggested-action")
-
-            def submit(*_):
-                try:
-                    if checksum.get_text().strip():
-                        parse_checksum(checksum.get_text())
-                except ValueError as e:
-                    msg.set_text(str(e))
-                    return
-                if self.add_url(entry.get_text(), chosen[0], checksum=checksum.get_text()):
-                    dlg.close()
-                else:
-                    msg.set_text("URL harus diawali http:// atau https://")
-
-            entry.connect("activate", submit)
-            checksum.connect("activate", submit)
-            ok.connect("clicked", submit)
-            for w in (Gtk.Label(label="Tempel URL file:", xalign=0), entry, where, checksum, msg, ok):
-                box.append(w)
-            dlg.set_child(box)
-
-            def got(clip, res):
-                try:
-                    text = clip.read_text_finish(res) or ""
-                    if re.match(r"https?://", text.strip()) and not entry.get_text():
-                        entry.set_text(text.strip())
-                except GLib.Error:
-                    pass
-
-            self.get_clipboard().read_text_async(None, got)
-            dlg.present()
-
-    class App(Gtk.Application):
+    class App(Adw.Application):
         def __init__(self):
             super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
             self.win = None
@@ -995,6 +1181,13 @@ def run_gui(urls, background=False):
                 act = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
                 act.connect("activate", lambda _a, param: open_path(param.get_string()))
                 self.add_action(act)
+
+        def do_startup(self):
+            Adw.Application.do_startup(self)
+            provider = Gtk.CssProvider()
+            provider.load_from_data(CSS)
+            Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,
+                                                      Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         def do_command_line(self, cmd):
             args = cmd.get_arguments()[1:]
@@ -1014,7 +1207,7 @@ def run_gui(urls, background=False):
             for d in mgr.items:
                 d.pause()
             mgr.save()
-            Gtk.Application.do_shutdown(self)
+            Adw.Application.do_shutdown(self)
 
     app = App()
     return app.run([sys.argv[0]] + (["--background"] if background else []) + urls)

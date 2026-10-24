@@ -11,7 +11,8 @@ dan browser kecil bernama KilatBrowser. Dibuat sebagai pengganti Internet Downlo
 - Verifikasi checksum (MD5, SHA-1, SHA-256, SHA-512) setelah unduhan selesai
 - **Ganti link**: kalau link bertoken kedaluwarsa, tempel link baru dan unduhan dilanjutkan dari titik terakhir
 - Notifikasi saat selesai atau gagal, dengan tombol Buka file / Buka folder
-- Ekstensi Firefox: menangkap unduhan browser (beserta cookie dan referer) dan mendeteksi video di halaman
+- Antarmuka libadwaita (mengikuti tema terang/gelap sistem): kartu per unduhan, filter Semua/Aktif/Selesai, tempel link dengan Ctrl+V atau tarik ke jendela
+- Ekstensi Firefox: menangkap unduhan browser (beserta cookie dan referer), mendeteksi video, dan menampilkan tombol **Unduh video** di atas pemutar (seperti IDM)
 - Berjalan otomatis di latar belakang saat login
 
 ## Pasang
@@ -23,7 +24,7 @@ dan browser kecil bernama KilatBrowser. Dibuat sebagai pengganti Internet Downlo
 Memasang `kilatdl` dan `kilatbrowser` ke `~/.local/bin`, entri menu aplikasi, dan autostart
 (`~/.config/autostart/kilatdl.desktop`; hapus file itu untuk mematikannya). Tidak memerlukan sudo.
 
-Kebutuhan: Python 3.10+, PyGObject dengan GTK 4 (jendela), WebKit2GTK 4.1 (hanya KilatBrowser).
+Kebutuhan: Python 3.10+, PyGObject dengan GTK 4 dan libadwaita 1 (jendela), WebKit2GTK 4.1 (hanya KilatBrowser).
 
 ## Pakai
 
@@ -58,6 +59,10 @@ salinan terpisah (dipakai untuk pengujian).
 
 ```bash
 python3 -m unittest discover -s tests -t . -v
+python3 tests/e2e_firefox.py          # ujung-ke-ujung di Firefox Developer Edition (tombol di video)
 ```
+
+`tests/e2e_firefox.py` memakai salinan profil dan instance KilatDL terpisah (port 9715), jadi data asli tidak tersentuh.
+Untuk tangkapan layar jendela: `KILATDL_SCREENSHOT=out.png KILATDL_SCHEME=dark kilatdl --gui`.
 
 `har_sanitize.py` membuat salinan file HAR yang aman dibagikan (cookie, token, dan isi respons dihapus).
