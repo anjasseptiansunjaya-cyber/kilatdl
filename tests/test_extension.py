@@ -13,7 +13,7 @@ class ExtensionClassifierTest(unittest.TestCase):
         background = os.path.abspath(os.path.join(HERE, "..", "extension", "background.js"))
         r = subprocess.run(["node", script, background], capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(r.stdout.count("ok  "), 11, r.stdout)
+        self.assertEqual(r.stdout.count("ok  "), 14, r.stdout)
 
 
 if __name__ == "__main__":

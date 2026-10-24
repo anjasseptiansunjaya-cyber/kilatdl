@@ -44,3 +44,15 @@ api.tabs.query({ active: true, currentWindow: true }).then(([tab]) => {
     }
   });
 });
+
+document.getElementById("ver").textContent = "v" + api.runtime.getManifest().version;
+document.getElementById("copy").addEventListener("click", async () => {
+  const [tab] = await api.tabs.query({ active: true, currentWindow: true });
+  api.runtime.sendMessage({ cmd: "report", tabId: tab.id }, async (rep) => {
+    let host = "";
+    try { host = new URL(tab.url).host; } catch (_) { /* no host */ }
+    const text = JSON.stringify({ halaman: host, ...rep }, null, 1); // hosts and file-name tails only, no query strings
+    try { await navigator.clipboard.writeText(text); document.getElementById("copy").textContent = "Tersalin"; }
+    catch (_) { document.body.append(Object.assign(document.createElement("pre"), { textContent: text })); }
+  });
+});

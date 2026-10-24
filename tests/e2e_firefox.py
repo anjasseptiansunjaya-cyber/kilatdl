@@ -70,11 +70,15 @@ def main():
                      "/dash.html": video_page.replace(b'fetch("master.m3u8").then(()=>fetch("s0.ts"))', b'fetch("manifest.mpd").then(()=>fetch("a1.m4s"))').replace(b' src="clip.mp4"', b""),
                      "/manifest.mpd": b"<MPD/>", "/a1.m4s": blob(50_000, 4),
                      "/seg.html": video_page.replace(b'fetch("master.m3u8").then(()=>fetch("s0.ts"))', b'fetch("s0.ts").then(()=>fetch("s1.ts"))').replace(b' src="clip.mp4"', b""),
-                     "/s1.ts": blob(60_000, 8)})
+                     "/s1.ts": blob(60_000, 8),
+                     "/octet.html": video_page.replace(b'fetch("master.m3u8").then(()=>fetch("s0.ts"))', b'0').replace(b"clip.mp4", b"stream"),
+                     "/stream": blob(700_000, 6),
+                     "/empty.html": video_page.replace(b'fetch("master.m3u8").then(()=>fetch("s0.ts"))', b'0').replace(b' src="clip.mp4"', b"")})
         site.types.update({"/page.html": "text/html", "/clip.mp4": "video/mp4", "/s0.ts": "video/mp2t",
                            "/master.m3u8": "application/vnd.apple.mpegurl", "/dash.html": "text/html",
                            "/seg.html": "text/html", "/manifest.mpd": "application/dash+xml",
-                           "/a1.m4s": "video/iso.segment", "/s1.ts": "video/mp2t"})
+                           "/a1.m4s": "video/iso.segment", "/s1.ts": "video/mp2t",
+                           "/octet.html": "text/html", "/empty.html": "text/html", "/stream": "application/octet-stream"})
 
         env = dict(os.environ, XDG_DATA_HOME=data, KILATDL_APP_ID="id.anjas.KilatDLTest", KILATDL_PORT=PORT)
         procs.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "kilatdl.py"), "--background"], env=env,
@@ -186,6 +190,30 @@ def main():
             note = probe("/seg.html")
             assert note and "potongan kecil" in note, note
             print("PASS  a page with bare stream pieces explains why nothing can be downloaded")
+
+            note = probe("/empty.html")
+            assert note and "Belum ada permintaan media sama sekali" in note, note
+            print("PASS  a page that never requested media says so")
+
+            # a video the server labels application/octet-stream and gives no extension is still found,
+            # because the browser requested it as <video>; read the background state via the report command
+            call("POST", base + "/url", {"url": site.url("/octet.html")})
+            time.sleep(4)
+            call("POST", base + "/window", {"handle": popup})
+            report = call("POST", base + "/execute/async", {"script": """
+                const done = arguments[arguments.length - 1];
+                (async () => {
+                  const tabs = await browser.tabs.query({});
+                  const t = tabs.find(x => x.url.includes('octet.html'));
+                  const rep = await new Promise(r => browser.runtime.sendMessage({cmd: 'report', tabId: t.id}, r));
+                  done(rep);
+                })();""", "args": []})
+            call("POST", base + "/window", {"handle": page_handle})
+            assert report["version"], report
+            assert any(i["kind"] == "file" for i in report["found"]), report
+            assert any(t["type"] == "media" and t["verdict"] == "file" and t["ctype"] == "application/octet-stream" for t in report["trace"]), report
+            assert any(v["src"] == "http" and not v["drm"] for v in report["videos"].values()), report
+            print(f"PASS  octet-stream media without extension is detected (report v{report['version']}: {len(report['trace'])} trace, {len(report['videos'])} video)")
         finally:
             try:
                 call("DELETE", base)

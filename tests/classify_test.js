@@ -15,4 +15,7 @@ t("segmen .m4s diabaikan", c("https://a.com/seg1.m4s", "video/iso.segment", 2e6)
 t("html bukan media", c("https://a.com/index.html", "text/html", 90e3), null);
 t("mp3", c("https://a.com/lagu.mp3", "audio/mpeg", 4e6), { kind: "file", ext: ".mp3" });
 t("manifest DASH dikenali (tapi tidak bisa diunduh)", c("https://a.com/v/manifest.mpd", "application/dash+xml", 5000), { kind: "dash", ext: "" });
+t("diminta sebagai <video> tapi octet-stream tanpa ekstensi", c("https://cdn.a.com/stream/9f3a", "application/octet-stream", 8e6, "media"), { kind: "file", ext: "" });
+t("octet-stream biasa (bukan media) diabaikan", c("https://a.com/download/app.bin", "application/octet-stream", 8e6, "xmlhttprequest"), null);
+t("application/mp4", c("https://a.com/v/9", "application/mp4", 4e6), { kind: "file", ext: ".mp4" });
 t("url rusak", c("bukan url", "video/mp4", 5e6), null);

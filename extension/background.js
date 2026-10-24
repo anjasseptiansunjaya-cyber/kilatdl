@@ -13,6 +13,15 @@ const TYPE_EXT = { "video/mp4": ".mp4", "video/webm": ".webm", "audio/mpeg": ".m
 const found = new Map();
 // what we saw but could not offer, per tab: {segments: n} (tiny stream pieces with no playlist)
 const diag = new Map();
+const trace = new Map();      // tabId -> last media-looking responses with the verdict we gave them
+const videos = new Map();     // tabId -> {frameId: info reported by the content script}
+const MEDIAISH = /video|audio|mpegurl|dash|mp4|ogg|webm|octet-stream|matroska/i;
+function record(tabId, entry) {
+  const list = trace.get(tabId) || [];
+  list.push(entry);
+  if (list.length > 30) list.shift();
+  trace.set(tabId, list);
+}
 
 // The background page can be suspended when idle; keep detections in session storage.
 const store = api.storage.session || api.storage.local;
@@ -28,7 +37,7 @@ const persist = () => store.set({
 }).catch(() => {});
 
 // Decide whether a response is a downloadable media file or an HLS playlist.
-function classify(url, contentType, size) {
+function classify(url, contentType, size, requestType) {
   let path;
   try { path = new URL(url).pathname; } catch (_) { return null; }
   const type = (contentType || "").split(";")[0].trim().toLowerCase();
@@ -37,10 +46,12 @@ function classify(url, contentType, size) {
     return { kind: "hls", ext: "" };
   }
   if (/\.mpd$/i.test(path) || type === "application/dash+xml") return { kind: "dash", ext: "" };
-  const isMedia = MEDIA_EXT.test(path) || type.startsWith("video/") || type.startsWith("audio/");
+  // requestType "media" = the page itself asked for it as <video>/<audio>, whatever the server calls it
+  const isMedia = MEDIA_EXT.test(path) || type.startsWith("video/") || type.startsWith("audio/") ||
+                  requestType === "media" || /^application\/(mp4|ogg|x-matroska)$/.test(type);
   if (!isMedia || type === "video/mp2t") return null;
   if (size && size < MIN_MEDIA_BYTES) return null;
-  const ext = (path.match(MEDIA_EXT) || [])[0] || TYPE_EXT[type] || "";
+  const ext = (path.match(MEDIA_EXT) || [])[0] || TYPE_EXT[type] || (type === "application/mp4" ? ".mp4" : "");
   return { kind: "file", ext };
 }
 globalThis.__classify = classify; // exposed for tests
@@ -60,7 +71,16 @@ api.webRequest.onResponseStarted.addListener(async (d) => {
   if (d.tabId < 0 || d.statusCode >= 400) return;
   const range = header(d.responseHeaders, "content-range").match(/\/(\d+)$/);
   const size = range ? +range[1] : +header(d.responseHeaders, "content-length") || 0;
-  const info = classify(d.url, header(d.responseHeaders, "content-type"), size);
+  const ctype = header(d.responseHeaders, "content-type");
+  const info = classify(d.url, ctype, size, d.type);
+  let pathname = "";
+  try { pathname = new URL(d.url).pathname; } catch (_) { /* not a URL */ }
+  if (d.type === "media" || MEDIAISH.test(ctype) || MEDIA_EXT.test(pathname) || SEGMENT_EXT.test(pathname) || /\.(m3u8|mpd)$/i.test(pathname)) {
+    let host = "";
+    try { host = new URL(d.url).host; } catch (_) { /* keep empty */ }
+    record(d.tabId, { type: d.type, status: d.statusCode, ctype: ctype.split(";")[0], size, host,
+                      path: pathname.slice(-60), verdict: info ? info.kind : (SEGMENT_EXT.test(pathname) ? "segmen" : "diabaikan") });
+  }
   if (!info) {
     try {
       if (SEGMENT_EXT.test(new URL(d.url).pathname)) {
@@ -81,9 +101,9 @@ api.webRequest.onResponseStarted.addListener(async (d) => {
 }, { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] }, ["responseHeaders"]);
 
 api.tabs.onUpdated.addListener((tabId, change) => {
-  if (change.status === "loading" && change.url) { found.delete(tabId); diag.delete(tabId); persist(); badge(tabId); }
+  if (change.status === "loading" && change.url) { found.delete(tabId); diag.delete(tabId); trace.delete(tabId); videos.delete(tabId); persist(); badge(tabId); }
 });
-api.tabs.onRemoved.addListener((tabId) => { found.delete(tabId); diag.delete(tabId); persist(); });
+api.tabs.onRemoved.addListener((tabId) => { found.delete(tabId); diag.delete(tabId); trace.delete(tabId); videos.delete(tabId); persist(); });
 
 function fileName(title, ext) {
   const base = (title || "video").replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_").trim().slice(0, 100) || "video";
@@ -142,7 +162,16 @@ api.runtime.onMessage.addListener((msg, sender, reply) => {
   if (msg.cmd === "list") {
     ready.then(() => reply([...(found.get(tabId) || new Map()).values()]));
   } else if (msg.cmd === "diagnose") {
-    ready.then(() => reply(diag.get(tabId) || { segments: 0 }));
+    ready.then(() => reply({ ...(diag.get(tabId) || { segments: 0 }), drm: Object.values(videos.get(tabId) || {}).some(v => v.drm),
+                              seen: (trace.get(tabId) || []).length }));
+  } else if (msg.cmd === "video-seen") {
+    const frames = videos.get(tabId) || {};
+    frames[sender.frameId] = msg.info;
+    videos.set(tabId, frames);
+    reply(true);
+  } else if (msg.cmd === "report") {
+    reply({ version: api.runtime.getManifest().version, trace: trace.get(tabId) || [], videos: videos.get(tabId) || {},
+            found: [...(found.get(tabId) || new Map()).values()].map(i => ({ kind: i.kind, size: i.size, ext: i.ext })) });
   } else if (msg.cmd === "download") {
     ready.then(() => api.tabs.get(tabId)).then(tab => {
       const item = (found.get(tabId) || new Map()).get(msg.url);

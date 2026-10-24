@@ -60,6 +60,18 @@
                             r.top < innerHeight && r.left < innerWidth && getComputedStyle(v).visibility !== "hidden");
   }
 
+  const reported = new WeakSet();
+  function report(v) {
+    if (reported.has(v)) return;
+    reported.add(v);
+    const src = v.currentSrc || v.src || "";
+    ask({ cmd: "video-seen", info: {
+      frame: window === window.top ? "halaman utama" : "iframe " + location.host,
+      src: !src ? "kosong" : /^blob:/i.test(src) ? "blob (MSE)" : /^https?:/i.test(src) ? "http" : src.split(":")[0],
+      sourceTags: v.querySelectorAll("source").length, readyState: v.readyState, drm: !!v.mediaKeys,
+      size: Math.round(v.getBoundingClientRect().width) + "x" + Math.round(v.getBoundingClientRect().height) } });
+  }
+
   function pickVideo() {
     const list = visibleVideos();
     list.sort((a, b) => (!b.v.paused - !a.v.paused) || (b.r.width * b.r.height - a.r.width * a.r.height));
@@ -73,6 +85,7 @@
     const pick = pickVideo();
     if (!pick) { hide(); return; }
     const { v, r } = pick;
+    report(v);
     const recent = Date.now() - pointer.t < 2500;
     const hovering = (recent && inside(r, pointer.x, pointer.y)) || host.matches(":hover");
     if (!(hovering || menuOpen || !v.paused)) { hide(); return; }
@@ -107,12 +120,17 @@
     if (direct && !items.some(i => i.url === direct)) items.unshift({ url: direct, kind: "file", size: 0 });
     menu.replaceChildren();
     if (!items.some(i => i.kind !== "dash")) {
-      const d = (await ask({ cmd: "diagnose" })) || { segments: 0 };
+      const d = (await ask({ cmd: "diagnose" })) || { segments: 0, seen: 0 };
       const blob = current && /^blob:/i.test(current.currentSrc);
       let why = "Belum ada media terdeteksi. Putar videonya beberapa detik, lalu klik lagi.";
       if (items.length) why = "Situs ini memakai DASH (streaming adaptif dengan audio dan video terpisah). KilatDL belum mendukung jenis ini.";
       else if (d.segments > 0) why = `Video dikirim dalam ${d.segments}+ potongan kecil tanpa playlist yang bisa dibaca, jadi tidak ada satu file untuk diunduh. Belum didukung.`;
+      else if (d.drm) why = "Video ini dilindungi DRM (terenkripsi), jadi tidak bisa diunduh.";
       else if (blob) why = "Video ini diputar lewat blob (MSE) dan belum ada permintaan media yang terbaca. Putar beberapa detik lalu klik lagi; kalau tetap kosong, situs ini belum didukung.";
+      if (!items.length && !d.segments && !d.drm && !blob) {
+        why += d.seen ? ` (${d.seen} permintaan media terlihat tapi tidak ada yang layak diunduh. Buka ikon ekstensi di toolbar, lalu klik "Salin diagnostik" dan kirim ke saya.)`
+                      : " (Belum ada permintaan media sama sekali dari halaman ini.)";
+      }
       menu.append(el("div", "note", why));
       return;
     }
