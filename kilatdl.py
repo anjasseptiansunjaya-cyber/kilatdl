@@ -7,7 +7,9 @@ Usage:
     kilatdl --gui URL           open the GUI with URL queued
 """
 import argparse
+import csv
 import hashlib
+import html.parser
 import http.server
 import json
 import os
@@ -21,7 +23,7 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
 
 APP_ID = os.environ.get("KILATDL_APP_ID", "id.anjas.KilatDL")
 ICON_NAME = "id.anjas.KilatDL"  # installed by install.sh (assets/kilatdl.svg)
@@ -32,6 +34,7 @@ RETRIES = 6
 DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "kilatdl")
 QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 BRIDGE_PORT = int(os.environ.get("KILATDL_PORT", "9614"))
 FATAL_HTTP = (401, 403, 404, 410)  # retrying will not help; usually an expired or forbidden link
 HLS_RE = re.compile(r"\.m3u8$", re.I)
@@ -159,6 +162,121 @@ class Scheduler:
         if done > self.done_before and not any(d.status == "paused" for d in items) and self.settings["after"] != "none":
             return self.settings["after"]
         return None
+
+
+def safe_url(url):
+    """The link without credentials, query string and fragment: signed links carry tokens there."""
+    p = urlsplit(url)
+    return urlunsplit((p.scheme, p.netloc.rsplit("@", 1)[-1], p.path, "", ""))
+
+
+class History:
+    """Finished and failed downloads, kept after they are removed from the list (newest first)."""
+
+    def __init__(self, path=None, limit=1000):
+        self.path, self.limit, self.entries = path or HISTORY_FILE, limit, []
+        try:
+            with open(self.path) as f:
+                self.entries = [e for e in json.load(f) if isinstance(e, dict)][:limit]
+        except (OSError, ValueError):
+            pass
+
+    def add(self, d):
+        entry = {"name": d.name or os.path.basename(d.path or "") or d.url, "url": safe_url(d.url), "path": d.path,
+                 "size": d.size, "when": int(time.time()), "status": d.status, "note": d.error}
+        self.entries = [entry] + [e for e in self.entries if (e.get("path"), e.get("url")) != (entry["path"], entry["url"])]
+        del self.entries[self.limit:]
+        self.save()
+
+    def save(self):
+        write_private(self.path, self.entries)
+
+    def clear(self):
+        self.entries = []
+        self.save()
+
+    def search(self, text=""):
+        words = (text or "").lower().split()
+        return [e for e in self.entries
+                if all(w in f"{e.get('name', '')} {e.get('url', '')} {e.get('path') or ''}".lower() for w in words)]
+
+    def export(self, path, entries=None):
+        """Write CSV or JSON, chosen by the file extension."""
+        entries = self.entries if entries is None else entries
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            if path.lower().endswith(".json"):
+                json.dump(entries, f, indent=1, ensure_ascii=False)
+                return
+            w = csv.writer(f)
+            w.writerow(["waktu", "nama", "ukuran_byte", "status", "url", "lokasi", "catatan"])
+            for e in entries:
+                w.writerow([time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(e.get("when", 0))), e.get("name", ""),
+                            e.get("size", 0), e.get("status", ""), e.get("url", ""), e.get("path") or "", e.get("note", "")])
+
+
+PAGE_EXT = {"", "html", "htm", "php", "asp", "aspx", "jsp", "cgi", "xhtml", "shtml"}
+
+
+class LinkParser(html.parser.HTMLParser):
+    """Collects file-like links from one HTML page: <a href> to non-page files, plus media sources."""
+
+    MEDIA = {"img": "src", "source": "src", "video": "src", "audio": "src", "embed": "src"}
+
+    def __init__(self, base):
+        super().__init__()
+        self.base, self.found = base, []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "base" and a.get("href"):
+            self.base = urljoin(self.base, a["href"])
+        refs = []
+        if tag == "a" and a.get("href"):
+            refs.append((a["href"], True))
+        elif tag in self.MEDIA and a.get(self.MEDIA[tag]):
+            refs.append((a[self.MEDIA[tag]], False))
+        if tag in ("img", "source") and a.get("srcset"):
+            refs += [(c.split()[0], False) for c in a["srcset"].split(",") if c.strip()]
+        for ref, needs_ext in refs:
+            url = urljoin(self.base, ref.strip())
+            parts = urlsplit(url)
+            if parts.scheme not in ("http", "https"):
+                continue
+            ext = os.path.splitext(unquote(parts.path))[1].lstrip(".").lower()
+            if needs_ext and ext in PAGE_EXT:
+                continue
+            self.found.append((urlunsplit(parts._replace(fragment="")), ext))
+
+
+def grab_links(page, base):
+    """HTML text -> [{"url", "name", "ext", "kind"}] without duplicates, in page order."""
+    parser = LinkParser(base)
+    parser.feed(page)
+    seen, out = set(), []
+    for url, ext in parser.found:
+        if url in seen:
+            continue
+        seen.add(url)
+        name = unquote(os.path.basename(urlsplit(url).path)) or url
+        out.append({"url": url, "name": name, "ext": ext, "kind": category_for("x." + ext) or "Lainnya"})
+    return out
+
+
+def filter_links(links, kind=None, exts=""):
+    """Keep links of one category and/or with one of the extensions typed by the user ('pdf, zip')."""
+    wanted = {e.strip().lstrip(".").lower() for e in re.split(r"[,\s]+", exts or "") if e.strip()}
+    return [l for l in links if (not kind or l["kind"] == kind) and (not wanted or l["ext"] in wanted)]
+
+
+def fetch_page(url, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        ctype = r.headers.get("Content-Type", "")
+        if ctype and "html" not in ctype.lower() and "xml" not in ctype.lower():
+            raise ValueError(f"bukan halaman web ({ctype.split(';')[0]}); itu file, tambahkan sebagai unduhan biasa")
+        data = r.read(8 << 20)
+        charset = r.headers.get_content_charset() or "utf-8"
+        return data.decode(charset, "replace"), r.geturl()
 
 
 def load_settings():
@@ -1028,6 +1146,7 @@ def run_gui(urls, background=False):
     settings = load_settings()
     mgr = Manager(settings["parallel"])
     scheduler = Scheduler(settings)
+    history = History()
     SCAN["on"] = bool(settings["scan"]) and bool(shutil.which("clamscan") or shutil.which("clamdscan"))
     mgr.load()
     LIMITER.rate = settings["limit_kbps"] * 1024
@@ -1156,6 +1275,9 @@ def run_gui(urls, background=False):
             header = Adw.HeaderBar(title_widget=tabs)
             header.pack_start(add)
             header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", popover=self.build_menu(app), tooltip_text="Pengaturan"))
+            hist = Gtk.Button(icon_name="document-open-recent-symbolic", tooltip_text="Riwayat unduhan (Ctrl+H)")
+            hist.connect("clicked", lambda *_: self.show_history())
+            header.pack_end(hist)
 
             self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10,
                                 margin_top=14, margin_bottom=14, margin_start=14, margin_end=14)
@@ -1189,8 +1311,10 @@ def run_gui(urls, background=False):
             self.connect("close-request", lambda *_: (self.set_visible(False), True)[1])
             self.rebuild()
             GLib.timeout_add(500, self.tick)
-            if os.environ.get("KILATDL_TEST_DIALOG") == "schedule":  # test hook
-                GLib.timeout_add(800, lambda: self.ask_schedule() and False)
+            dialog = {"schedule": self.ask_schedule, "history": self.show_history, "grab": self.ask_grab}.get(
+                os.environ.get("KILATDL_TEST_DIALOG"))
+            if dialog:  # test hook: open a dialog shortly after start-up
+                GLib.timeout_add(800, lambda: dialog() and False)
             if os.environ.get("KILATDL_SCREENSHOT"):  # test hook: render the window to a PNG, then quit
                 GLib.timeout_add(2500, self.snapshot)
 
@@ -1237,13 +1361,15 @@ def run_gui(urls, background=False):
 
             sort_row = switch_row("Folder otomatis per jenis file", "sort")
             scan_row = switch_row("Pindai virus (ClamAV)", "scan", toggle_scan)
+            grab_btn = Gtk.Button(label="Ambil file dari halaman web...")
+            grab_btn.connect("clicked", lambda *_: (self.menu_pop.popdown(), self.ask_grab()))
             sched_btn = Gtk.Button(label="Jadwal & aksi akhir...")
             sched_btn.connect("clicked", lambda *_: (self.menu_pop.popdown(), self.ask_schedule()))
             quit_btn = Gtk.Button(label="Keluar dari KilatDL")
             quit_btn.add_css_class("destructive-action")
             quit_btn.connect("clicked", lambda *_: app.quit())
             for w in (row, hint, Gtk.Separator(), Gtk.Label(label="Folder tujuan", xalign=0), self.folder_btn,
-                      sort_row, scan_row, Gtk.Separator(), sched_btn, Gtk.Separator(), quit_btn):
+                      sort_row, scan_row, Gtk.Separator(), grab_btn, sched_btn, Gtk.Separator(), quit_btn):
                 box.append(w)
             self.menu_pop = Gtk.Popover(child=box)
             return self.menu_pop
@@ -1428,8 +1554,10 @@ def run_gui(urls, background=False):
             mgr.schedule()
 
         # -- adding ----------------------------------------------------------
-        def add_url(self, url, directory=None, headers=None, name=None, checksum=None):
+        def add_url(self, url, directory=None, headers=None, name=None, checksum=None, referer=None, quiet=False):
             url = url.strip()
+            if referer and not headers:
+                headers = {"Referer": referer}
             if not re.match(r"https?://", url):
                 return False
             sort = settings["sort"] and directory in (None, settings["directory"])  # a folder picked by hand is respected
@@ -1438,7 +1566,8 @@ def run_gui(urls, background=False):
                 dl.set_checksum(checksum)
             mgr.add(dl)
             self.rebuild()
-            self.toasts.add_toast(Adw.Toast.new("Unduhan ditambahkan"))
+            if not quiet:
+                self.toasts.add_toast(Adw.Toast.new("Unduhan ditambahkan"))
             return True
 
         def add_text(self, text):
@@ -1459,6 +1588,9 @@ def run_gui(urls, background=False):
                 return True
             if ctrl and keyval == Gdk.KEY_n:
                 self.ask_url()
+                return True
+            if ctrl and keyval == Gdk.KEY_h:
+                self.show_history()
                 return True
             return False
 
@@ -1555,6 +1687,213 @@ def run_gui(urls, background=False):
             dlg.present(self)
             entry.grab_focus()
 
+        # -- history ---------------------------------------------------------
+        def show_history(self):
+            dlg = Adw.Dialog(title="Riwayat unduhan", content_width=600, content_height=600)
+            search = Gtk.SearchEntry(placeholder_text="Cari nama atau alamat...")
+            box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+            empty = Adw.StatusPage(icon_name="document-open-recent-symbolic", title="Tidak ada hasil", vexpand=True)
+            stack = Gtk.Stack()
+            stack.add_named(Gtk.ScrolledWindow(child=Adw.Clamp(child=box, margin_top=6, margin_bottom=6, margin_start=12, margin_end=12),
+                                               vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER), "list")
+            stack.add_named(empty, "empty")
+            shown = []
+
+            def fill(*_):
+                shown.clear()
+                while child := box.get_first_child():
+                    box.remove(child)
+                for e in history.search(search.get_text())[:300]:
+                    shown.append(e)
+                    when = time.strftime("%d %b %Y %H:%M", time.localtime(e.get("when", 0)))
+                    failed = e.get("status") != "done"
+                    row = Adw.ActionRow(title=GLib.markup_escape_text(e.get("name", "")), title_lines=1, subtitle_lines=1,
+                                        subtitle=GLib.markup_escape_text(f"{when}  •  " + (f"gagal: {e.get('note', '')}" if failed else human(e.get("size", 0)))))
+                    if not failed and e.get("path") and os.path.exists(e["path"]):
+                        row.add_suffix(icon_button("document-open-symbolic", "Buka file", lambda *_, p=e["path"]: open_path(p)))
+                        row.add_suffix(icon_button("folder-open-symbolic", "Buka folder", lambda *_, p=e["path"]: open_path(os.path.dirname(p))))
+                    elif not failed:
+                        row.add_css_class("dim-label")
+                        row.set_subtitle(row.get_subtitle() + "  •  file sudah tidak ada")
+                    row.add_suffix(icon_button("view-refresh-symbolic", "Unduh lagi", lambda *_, u=e["url"]: self.add_url(u)))
+                    box.append(row)
+                empty.set_description("Belum ada unduhan selesai." if not history.entries else "Coba kata kunci lain.")
+                stack.set_visible_child_name("list" if shown else "empty")
+
+            def export(ext):
+                chooser = Gtk.FileDialog(title="Ekspor riwayat", initial_name=f"riwayat-kilatdl.{ext}")
+
+                def done(c, res):
+                    try:
+                        path = c.save_finish(res).get_path()
+                        history.export(path, history.search(search.get_text()))
+                        self.toasts.add_toast(Adw.Toast.new(f"Riwayat diekspor: {os.path.basename(path)}"))
+                    except GLib.Error:
+                        pass  # cancelled
+                    except OSError as e:
+                        self.toasts.add_toast(Adw.Toast.new(f"Gagal menyimpan: {e}"))
+
+                chooser.save(self, None, done)
+
+            def wipe(*_):
+                confirm = Adw.AlertDialog(heading="Kosongkan riwayat?", body="Hanya daftar riwayat yang dihapus. File yang sudah diunduh tidak disentuh.")
+                confirm.add_response("cancel", "Batal")
+                confirm.add_response("ok", "Kosongkan")
+                confirm.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
+
+                def answered(_d, r):
+                    if r == "ok":
+                        history.clear()
+                        fill()
+
+                confirm.connect("response", answered)
+                confirm.present(dlg)
+
+            search.connect("search-changed", fill)
+            bar = Gtk.Box(spacing=8, margin_top=8, margin_bottom=12, margin_start=12, margin_end=12)
+            for label, cb in (("Ekspor CSV", lambda *_: export("csv")), ("Ekspor JSON", lambda *_: export("json"))):
+                b = Gtk.Button(label=label)
+                b.connect("clicked", cb)
+                bar.append(b)
+            wipe_btn = Gtk.Button(label="Kosongkan", hexpand=True, halign=Gtk.Align.END)
+            wipe_btn.add_css_class("destructive-action")
+            wipe_btn.connect("clicked", wipe)
+            bar.append(wipe_btn)
+            top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin_start=12, margin_end=12, margin_top=8)
+            top.append(search)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            for w in (top, stack, bar):
+                body.append(w)
+            view = Adw.ToolbarView()
+            view.add_top_bar(Adw.HeaderBar())
+            view.set_content(body)
+            dlg.set_child(view)
+            fill()
+            dlg.present(self)
+            search.grab_focus()
+
+        # -- page grabber ----------------------------------------------------
+        def ask_grab(self):
+            dlg = Adw.Dialog(title="Ambil file dari halaman web", content_width=620, content_height=640)
+            url = Adw.EntryRow(title="Alamat halaman (https://...)")
+            find = Gtk.Button(label="Cari", valign=Gtk.Align.CENTER)
+            find.add_css_class("suggested-action")
+            url.add_suffix(find)
+            kinds = ["Semua jenis", "Gambar", "Dokumen", "Arsip", "Video", "Musik", "Program", "Lainnya"]
+            kind = Gtk.DropDown.new_from_strings(kinds)
+            exts = Gtk.Entry(placeholder_text="atau ketik ekstensi: pdf, zip", hexpand=True)
+            filt = Gtk.Box(spacing=8)
+            filt.append(kind)
+            filt.append(exts)
+            box = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+            note = Gtk.Label(xalign=0, wrap=True, label="Masukkan alamat halaman, lalu klik Cari. Hanya halaman itu yang dibaca (tidak menelusuri halaman lain).")
+            note.add_css_class("dim-label")
+            count = Gtk.Label(xalign=0, hexpand=True)
+            go = Gtk.Button(label="Unduh terpilih", sensitive=False)
+            go.add_css_class("suggested-action")
+            go.add_css_class("pill")
+            toggle = Gtk.Button(label="Pilih semua")
+            rows = []   # (link, row, check)
+            links = []
+
+            def visible():
+                return [(l, r, c) for l, r, c in rows if r.get_visible()]
+
+            def recount(*_):
+                chosen = sum(c.get_active() for _l, _r, c in visible())
+                count.set_text(f"{chosen} dipilih dari {len(visible())} file" if rows else "")
+                go.set_sensitive(chosen > 0)
+
+            def apply_filter(*_):
+                keep = {l["url"] for l in filter_links(links, None if kind.get_selected() == 0 else kinds[kind.get_selected()], exts.get_text())}
+                for l, r, c in rows:
+                    r.set_visible(l["url"] in keep)
+                    if l["url"] not in keep:
+                        c.set_active(False)
+                recount()
+
+            def populate(found, final_url):
+                links[:] = found[:500]
+                rows.clear()
+                while child := box.get_first_child():
+                    box.remove(child)
+                for l in links:
+                    check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+                    row = Adw.ActionRow(title=GLib.markup_escape_text(l["name"]), subtitle=GLib.markup_escape_text(f"{l['kind']}  •  {urlsplit(l['url']).netloc}"),
+                                        title_lines=1, subtitle_lines=1, activatable_widget=check)
+                    row.add_prefix(check)
+                    check.connect("toggled", recount)
+                    box.append(row)
+                    rows.append((l, row, check))
+                note.set_text(f"Ditemukan {len(found)} file di halaman ini." + (" Menampilkan 500 pertama." if len(found) > 500 else "")
+                              if found else "Tidak ada file yang bisa diunduh di halaman ini.")
+                apply_filter()
+
+            def search_page(*_):
+                target = url.get_text().strip()
+                if not re.match(r"https?://", target):
+                    note.set_text("Alamat harus diawali http:// atau https://")
+                    return
+                find.set_sensitive(False)
+                note.set_text("Membaca halaman...")
+
+                def work():
+                    try:
+                        text, final = fetch_page(target)
+                        found = grab_links(text, final)
+                        GLib.idle_add(lambda: (populate(found, final), find.set_sensitive(True)) and False)
+                    except (OSError, ValueError) as e:
+                        GLib.idle_add(lambda: (note.set_text(f"Gagal membaca halaman: {e}"), find.set_sensitive(True)) and False)
+
+                threading.Thread(target=work, daemon=True).start()
+
+            def toggle_all(*_):
+                vis = visible()
+                want = not all(c.get_active() for _l, _r, c in vis)
+                for _l, _r, c in vis:
+                    c.set_active(want)
+                toggle.set_label("Kosongkan pilihan" if want else "Pilih semua")
+
+            def download(*_):
+                picked = [l for l, _r, c in visible() if c.get_active()]
+                for l in picked:
+                    self.add_url(l["url"], referer=url.get_text().strip(), quiet=True)
+                dlg.close()
+                self.toasts.add_toast(Adw.Toast.new(f"{len(picked)} unduhan ditambahkan"))
+
+            url.connect("entry-activated", search_page)
+            find.connect("clicked", search_page)
+            kind.connect("notify::selected", apply_filter)
+            exts.connect("changed", apply_filter)
+            toggle.connect("clicked", toggle_all)
+            go.connect("clicked", download)
+            foot = Gtk.Box(spacing=8)
+            for w in (count, toggle, go):
+                foot.append(w)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_top=12, margin_bottom=14, margin_start=14, margin_end=14)
+            body.append(Adw.PreferencesGroup())
+            body.get_first_child().add(url)
+            for w in (filt, note):
+                body.append(w)
+            body.append(Gtk.ScrolledWindow(child=box, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+            body.append(foot)
+            view = Adw.ToolbarView()
+            view.add_top_bar(Adw.HeaderBar())
+            view.set_content(body)
+            dlg.set_child(view)
+
+            def got(clip, res):
+                try:
+                    text = (clip.read_text_finish(res) or "").strip()
+                    if re.match(r"https?://", text) and not url.get_text():
+                        url.set_text(text)
+                except GLib.Error:
+                    pass
+
+            self.get_clipboard().read_text_async(None, got)
+            dlg.present(self)
+            url.grab_focus()
+
         # -- notifications ---------------------------------------------------
         def notify_finished(self):
             app = self.get_application()
@@ -1565,6 +1904,7 @@ def run_gui(urls, background=False):
                 if not (finished or d.status == "error"):
                     continue
                 d.notified = True
+                history.add(d)
                 if d.status == "error":
                     note = Gio.Notification.new("Unduhan gagal")
                     note.set_body(f"{d.name or d.url}\n{d.error}")

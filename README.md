@@ -63,6 +63,16 @@ Keduanya dinyalakan di menu ☰ (atau `--sort` / `--scan` di mode terminal).
   Pasang dengan `sudo apt install clamav`. File yang terdeteksi hanya ditandai dan diberi notifikasi;
   KilatDL tidak pernah menghapusnya sendiri.
 
+## Riwayat dan pengambil file dari halaman
+
+- **Riwayat** (ikon jam di header, atau Ctrl+H): semua unduhan yang selesai atau gagal tetap tercatat meski
+  sudah dihapus dari daftar. Bisa dicari, dibuka lagi, diunduh ulang, diekspor ke CSV/JSON, atau dikosongkan
+  (file aslinya tidak disentuh). Alamat disimpan tanpa query string dan kredensial karena link bertanda tangan
+  memuat token di sana; jadi "Unduh lagi" bisa gagal untuk link yang butuh token.
+- **Ambil file dari halaman** (menu ☰): tempel alamat halaman, KilatDL mencari tautan file (PDF, arsip, gambar,
+  video, audio, dst.) di halaman itu, Anda memilih mana yang diunduh, bisa disaring per jenis atau ekstensi.
+  Hanya halaman itu yang dibaca; tidak menelusuri halaman lain, dan halaman yang butuh login belum didukung.
+
 ## Data
 
 `~/.local/share/kilatdl/` berisi `queue.json` (dapat memuat cookie sesi, izin 0600) dan `settings.json`.
