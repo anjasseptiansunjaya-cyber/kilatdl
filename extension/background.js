@@ -11,15 +11,21 @@ const TYPE_EXT = { "video/mp4": ".mp4", "video/webm": ".webm", "audio/mpeg": ".m
 
 // tabId -> Map(url -> {url, kind, size, ext})
 const found = new Map();
+// what we saw but could not offer, per tab: {segments: n} (tiny stream pieces with no playlist)
+const diag = new Map();
 
 // The background page can be suspended when idle; keep detections in session storage.
 const store = api.storage.session || api.storage.local;
-const ready = store.get("found").then(({ found: saved = {} }) => {
+const ready = store.get(["found", "diag"]).then(({ found: saved = {}, diag: savedDiag = {} }) => {
   for (const [tab, items] of Object.entries(saved)) {
     if (!found.has(+tab)) found.set(+tab, new Map(items.map(i => [i.url, i])));
   }
+  for (const [tab, d] of Object.entries(savedDiag)) if (!diag.has(+tab)) diag.set(+tab, d);
 }).catch(() => {});
-const persist = () => store.set({ found: Object.fromEntries([...found].map(([t, m]) => [t, [...m.values()]])) }).catch(() => {});
+const persist = () => store.set({
+  found: Object.fromEntries([...found].map(([t, m]) => [t, [...m.values()]])),
+  diag: Object.fromEntries(diag),
+}).catch(() => {});
 
 // Decide whether a response is a downloadable media file or an HLS playlist.
 function classify(url, contentType, size) {
@@ -30,6 +36,7 @@ function classify(url, contentType, size) {
   if (/\.m3u8$/i.test(path) || type === "application/vnd.apple.mpegurl" || type === "application/x-mpegurl") {
     return { kind: "hls", ext: "" };
   }
+  if (/\.mpd$/i.test(path) || type === "application/dash+xml") return { kind: "dash", ext: "" };
   const isMedia = MEDIA_EXT.test(path) || type.startsWith("video/") || type.startsWith("audio/");
   if (!isMedia || type === "video/mp2t") return null;
   if (size && size < MIN_MEDIA_BYTES) return null;
@@ -54,7 +61,17 @@ api.webRequest.onResponseStarted.addListener(async (d) => {
   const range = header(d.responseHeaders, "content-range").match(/\/(\d+)$/);
   const size = range ? +range[1] : +header(d.responseHeaders, "content-length") || 0;
   const info = classify(d.url, header(d.responseHeaders, "content-type"), size);
-  if (!info) return;
+  if (!info) {
+    try {
+      if (SEGMENT_EXT.test(new URL(d.url).pathname)) {
+        const x = diag.get(d.tabId) || { segments: 0 };
+        x.segments++;
+        diag.set(d.tabId, x);
+        if (x.segments === 1 || x.segments % 20 === 0) persist();
+      }
+    } catch (_) { /* not a URL */ }
+    return;
+  }
   const list = found.get(d.tabId) || new Map();
   const key = d.url.split("#")[0];
   if (!list.has(key)) list.set(key, { url: key, size, ...info });
@@ -64,9 +81,9 @@ api.webRequest.onResponseStarted.addListener(async (d) => {
 }, { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] }, ["responseHeaders"]);
 
 api.tabs.onUpdated.addListener((tabId, change) => {
-  if (change.status === "loading" && change.url) { found.delete(tabId); persist(); badge(tabId); }
+  if (change.status === "loading" && change.url) { found.delete(tabId); diag.delete(tabId); persist(); badge(tabId); }
 });
-api.tabs.onRemoved.addListener((tabId) => { found.delete(tabId); persist(); });
+api.tabs.onRemoved.addListener((tabId) => { found.delete(tabId); diag.delete(tabId); persist(); });
 
 function fileName(title, ext) {
   const base = (title || "video").replace(/[\\/:*?"<>|\x00-\x1f]+/g, "_").trim().slice(0, 100) || "video";
@@ -124,9 +141,12 @@ api.runtime.onMessage.addListener((msg, sender, reply) => {
   const tabId = msg.tabId ?? (sender.tab && sender.tab.id); // content scripts do not know their tab id
   if (msg.cmd === "list") {
     ready.then(() => reply([...(found.get(tabId) || new Map()).values()]));
+  } else if (msg.cmd === "diagnose") {
+    ready.then(() => reply(diag.get(tabId) || { segments: 0 }));
   } else if (msg.cmd === "download") {
     ready.then(() => api.tabs.get(tabId)).then(tab => {
       const item = (found.get(tabId) || new Map()).get(msg.url);
+      if (item && item.kind === "dash") return false; // DASH needs separate audio/video handling: not supported
       let ext = item ? item.ext : "";
       if (!item) { try { ext = (new URL(msg.url).pathname.match(MEDIA_EXT) || [""])[0]; } catch (_) { /* keep empty */ } }
       return send(msg.url, tab.url, fileName(tab.title, ext));

@@ -62,13 +62,19 @@ def main():
             json.dump({"directory": out_dir, "limit_kbps": 0, "parallel": 3}, f)
 
         clip = blob(700_000, 3)
-        page = (b'<!doctype html><title>Kuliah Hidrolika Uji</title><body style="margin:0;background:#222">'
+        page = video_page = (b'<!doctype html><title>Kuliah Hidrolika Uji</title><body style="margin:0;background:#222">'
                 b'<video id="v" src="clip.mp4" width="640" height="360" controls muted preload="auto"></video>'
                 b'<script>fetch("master.m3u8").then(()=>fetch("s0.ts"))</script>')
         site = Site({"/page.html": page, "/clip.mp4": clip, "/s0.ts": blob(60_000, 9),
-                     "/master.m3u8": b"#EXTM3U\n#EXTINF:4,\ns0.ts\n#EXT-X-ENDLIST\n"})
+                     "/master.m3u8": b"#EXTM3U\n#EXTINF:4,\ns0.ts\n#EXT-X-ENDLIST\n",
+                     "/dash.html": video_page.replace(b'fetch("master.m3u8").then(()=>fetch("s0.ts"))', b'fetch("manifest.mpd").then(()=>fetch("a1.m4s"))').replace(b' src="clip.mp4"', b""),
+                     "/manifest.mpd": b"<MPD/>", "/a1.m4s": blob(50_000, 4),
+                     "/seg.html": video_page.replace(b'fetch("master.m3u8").then(()=>fetch("s0.ts"))', b'fetch("s0.ts").then(()=>fetch("s1.ts"))').replace(b' src="clip.mp4"', b""),
+                     "/s1.ts": blob(60_000, 8)})
         site.types.update({"/page.html": "text/html", "/clip.mp4": "video/mp4", "/s0.ts": "video/mp2t",
-                           "/master.m3u8": "application/vnd.apple.mpegurl"})
+                           "/master.m3u8": "application/vnd.apple.mpegurl", "/dash.html": "text/html",
+                           "/seg.html": "text/html", "/manifest.mpd": "application/dash+xml",
+                           "/a1.m4s": "video/iso.segment", "/s1.ts": "video/mp2t"})
 
         env = dict(os.environ, XDG_DATA_HOME=data, KILATDL_APP_ID="id.anjas.KilatDLTest", KILATDL_PORT=PORT)
         procs.append(subprocess.Popen([sys.executable, os.path.join(ROOT, "kilatdl.py"), "--background"], env=env,
@@ -163,6 +169,23 @@ def main():
             path = os.path.join(out_dir, got[0])
             assert open(path, "rb").read() == clip, "downloaded bytes differ"
             print(f"PASS  one click on Unduh delivered the video to KilatDL ({got[0]}, {os.path.getsize(path)} bytes, identical)")
+
+            def probe(path):
+                """Open a page, hover its video, open the overlay menu and return the explanation it shows."""
+                call("POST", base + "/url", {"url": site.url(path)})
+                time.sleep(3)
+                call("POST", base + "/actions", move)
+                _, button = wait_for(overlay_button, 15, f"overlay button on {path}")
+                call("POST", base + f"/element/{list(button.values())[0]}/click", {})
+                time.sleep(1.5)
+                return call("POST", base + "/execute/sync", {"script": "const n = document.querySelector('kilatdl-overlay').shadowRoot.querySelector('.note'); return n ? n.innerText : null;", "args": []})
+
+            note = probe("/dash.html")
+            assert note and "DASH" in note, note
+            print("PASS  a DASH page explains that DASH is not supported")
+            note = probe("/seg.html")
+            assert note and "potongan kecil" in note, note
+            print("PASS  a page with bare stream pieces explains why nothing can be downloaded")
         finally:
             try:
                 call("DELETE", base)

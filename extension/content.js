@@ -106,11 +106,17 @@
     const direct = current && /^https?:/i.test(current.currentSrc) ? current.currentSrc : null;
     if (direct && !items.some(i => i.url === direct)) items.unshift({ url: direct, kind: "file", size: 0 });
     menu.replaceChildren();
-    if (!items.length) {
-      menu.append(el("div", "note", "Belum ada media terdeteksi. Putar videonya beberapa detik, lalu klik lagi."));
+    if (!items.some(i => i.kind !== "dash")) {
+      const d = (await ask({ cmd: "diagnose" })) || { segments: 0 };
+      const blob = current && /^blob:/i.test(current.currentSrc);
+      let why = "Belum ada media terdeteksi. Putar videonya beberapa detik, lalu klik lagi.";
+      if (items.length) why = "Situs ini memakai DASH (streaming adaptif dengan audio dan video terpisah). KilatDL belum mendukung jenis ini.";
+      else if (d.segments > 0) why = `Video dikirim dalam ${d.segments}+ potongan kecil tanpa playlist yang bisa dibaca, jadi tidak ada satu file untuk diunduh. Belum didukung.`;
+      else if (blob) why = "Video ini diputar lewat blob (MSE) dan belum ada permintaan media yang terbaca. Putar beberapa detik lalu klik lagi; kalau tetap kosong, situs ini belum didukung.";
+      menu.append(el("div", "note", why));
       return;
     }
-    for (const it of items) {
+    for (const it of items.filter(i => i.kind !== "dash")) {
       const row = el("div", "item");
       const meta = el("div", "meta");
       const file = it.url.split("?")[0].split("/").pop() || it.url;

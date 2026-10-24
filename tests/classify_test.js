@@ -14,4 +14,5 @@ t("segmen .ts diabaikan", c("https://a.com/seg1.ts", "video/mp2t", 2e6), null);
 t("segmen .m4s diabaikan", c("https://a.com/seg1.m4s", "video/iso.segment", 2e6), null);
 t("html bukan media", c("https://a.com/index.html", "text/html", 90e3), null);
 t("mp3", c("https://a.com/lagu.mp3", "audio/mpeg", 4e6), { kind: "file", ext: ".mp3" });
+t("manifest DASH dikenali (tapi tidak bisa diunduh)", c("https://a.com/v/manifest.mpd", "application/dash+xml", 5000), { kind: "dash", ext: "" });
 t("url rusak", c("bukan url", "video/mp4", 5e6), null);
