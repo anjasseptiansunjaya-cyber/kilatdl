@@ -14,8 +14,8 @@
   host.style.cssText = "all:initial;position:fixed;z-index:2147483647;display:none;top:0;left:0;";
   // open on purpose: pages can read it but cannot act through it, every handler checks isTrusted
   const root = host.attachShadow({ mode: "open" });
-  root.innerHTML = `
-    <style>
+  const style = document.createElement("style");
+  style.textContent = `
       * { box-sizing: border-box; }
       #btn { all: unset; font: ${FONT}; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 8px 14px 8px 10px;
              border-radius: 999px; color: #fff; background: rgba(24,24,28,.86); backdrop-filter: blur(6px);
@@ -35,11 +35,14 @@
       .go { all: unset; font: ${FONT}; cursor: pointer; padding: 6px 12px; border-radius: 8px; background: #e0521e; color: #fff; font-weight: 600; }
       .go:hover { background: #f2682f; }
       .go[disabled] { background: #3a7d44; cursor: default; }
-    </style>
-    <button id="btn" type="button" aria-label="Unduh video dengan KilatDL">
+    `;
+  root.append(style);
+  const frame = document.createElement("template");
+  frame.innerHTML = `<button id="btn" type="button" aria-label="Unduh video dengan KilatDL">
       <svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L10 22l9-12h-6z" fill="currentColor" stroke="none"/></svg><span>Unduh video</span>
     </button>
-    <div id="menu" hidden></div>`;
+    <div id="menu" hidden></div>`;  // static markup only, no variables
+  root.append(frame.content);
   const btn = root.getElementById("btn");
   const menu = root.getElementById("menu");
 
