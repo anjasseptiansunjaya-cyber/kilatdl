@@ -122,12 +122,11 @@
     const direct = current && /^https?:/i.test(current.currentSrc) ? current.currentSrc : null;
     if (direct && !items.some(i => i.url === direct)) items.unshift({ url: direct, kind: "file", size: 0 });
     menu.replaceChildren();
-    if (!items.some(i => i.kind !== "dash")) {
+    if (!items.length) {
       const d = (await ask({ cmd: "diagnose" })) || { segments: 0, seen: 0 };
       const blob = current && /^blob:/i.test(current.currentSrc);
       let why = "Belum ada media terdeteksi. Putar videonya beberapa detik, lalu klik lagi.";
-      if (items.length) why = "Situs ini memakai DASH (streaming adaptif dengan audio dan video terpisah). KilatDL belum mendukung jenis ini.";
-      else if (d.segments > 0) why = `Video dikirim dalam ${d.segments}+ potongan kecil tanpa playlist yang bisa dibaca, jadi tidak ada satu file untuk diunduh. Belum didukung.`;
+      if (d.segments > 0) why = `Video dikirim dalam ${d.segments}+ potongan kecil tanpa playlist yang bisa dibaca, jadi tidak ada satu file untuk diunduh. Belum didukung.`;
       else if (d.drm) why = "Video ini dilindungi DRM (terenkripsi), jadi tidak bisa diunduh.";
       else if (blob) why = "Video ini diputar lewat blob (MSE) dan belum ada permintaan media yang terbaca. Putar beberapa detik lalu klik lagi; kalau tetap kosong, situs ini belum didukung.";
       if (!items.length && !d.segments && !d.drm && !blob) {
@@ -137,11 +136,11 @@
       menu.append(el("div", "note", why));
       return;
     }
-    for (const it of items.filter(i => i.kind !== "dash")) {
+    for (const it of items) {
       const row = el("div", "item");
       const meta = el("div", "meta");
       const file = it.url.split("?")[0].split("/").pop() || it.url;
-      meta.append(el("div", "name", file), el("div", "sub", (it.kind === "hls" ? "Video HLS (streaming)" : "Berkas media" + (it.size ? " • " + human(it.size) : ""))));
+      meta.append(el("div", "name", file), el("div", "sub", (it.kind === "hls" ? "Video HLS (streaming)" : it.kind === "dash" ? "Video DASH (audio+video digabung, butuh ffmpeg)" : "Berkas media" + (it.size ? " • " + human(it.size) : ""))));
       const go = el("button", "go", "Unduh");
       go.addEventListener("click", async (e) => {
         if (!e.isTrusted) return;

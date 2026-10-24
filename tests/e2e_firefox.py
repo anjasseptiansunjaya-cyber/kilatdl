@@ -182,11 +182,11 @@ def main():
                 _, button = wait_for(overlay_button, 15, f"overlay button on {path}")
                 call("POST", base + f"/element/{list(button.values())[0]}/click", {})
                 time.sleep(1.5)
-                return call("POST", base + "/execute/sync", {"script": "const n = document.querySelector('kilatdl-overlay').shadowRoot.querySelector('.note'); return n ? n.innerText : null;", "args": []})
+                return call("POST", base + "/execute/sync", {"script": "const n = document.querySelector('kilatdl-overlay').shadowRoot.querySelector('.note'); return n ? n.innerText : [...document.querySelector('kilatdl-overlay').shadowRoot.querySelectorAll('.item .sub')].map(x => x.innerText).join('|');", "args": []})
 
             note = probe("/dash.html")
             assert note and "DASH" in note, note
-            print("PASS  a DASH page explains that DASH is not supported")
+            print("PASS  a DASH page offers the manifest for download")
             note = probe("/seg.html")
             assert note and "potongan kecil" in note, note
             print("PASS  a page with bare stream pieces explains why nothing can be downloaded")

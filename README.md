@@ -50,10 +50,11 @@ salinan terpisah (dipakai untuk pengujian).
 
 ## Batasan
 
-- Video terenkripsi (AES/DRM), DASH (`.mpd`), dan stream live belum didukung
+- Video terenkripsi (AES/DRM) dan stream live belum didukung
 - Server yang sengaja memblokir klien non-browser akan menolak KilatDL (HTTP 403); unduh lewat
   browser dengan ekstensi supaya permintaan datang dari browser Anda sendiri
-- Tidak menggabungkan audio dan video yang terpisah (butuh ffmpeg)
+- DASH (`.mpd`) statis didukung; bila audio dan video terpisah, KilatDL memakai ffmpeg untuk menggabungnya
+  (`sudo apt install ffmpeg`). Satu Period saja, tanpa DRM. File audio+video terpisah yang bukan DASH belum didukung
 
 ## Uji
 

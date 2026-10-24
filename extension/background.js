@@ -175,7 +175,6 @@ api.runtime.onMessage.addListener((msg, sender, reply) => {
   } else if (msg.cmd === "download") {
     ready.then(() => api.tabs.get(tabId)).then(tab => {
       const item = (found.get(tabId) || new Map()).get(msg.url);
-      if (item && item.kind === "dash") return false; // DASH needs separate audio/video handling: not supported
       let ext = item ? item.ext : "";
       if (!item) { try { ext = (new URL(msg.url).pathname.match(MEDIA_EXT) || [""])[0]; } catch (_) { /* keep empty */ } }
       return send(msg.url, tab.url, fileName(tab.title, ext));

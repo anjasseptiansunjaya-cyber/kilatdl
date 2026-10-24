@@ -12,12 +12,15 @@ import http.server
 import json
 import os
 import re
+import math
 import shutil
+import subprocess
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from urllib.parse import unquote, urljoin, urlsplit
 
 APP_ID = os.environ.get("KILATDL_APP_ID", "id.anjas.KilatDL")
@@ -32,6 +35,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 BRIDGE_PORT = int(os.environ.get("KILATDL_PORT", "9614"))
 FATAL_HTTP = (401, 403, 404, 410)  # retrying will not help; usually an expired or forbidden link
 HLS_RE = re.compile(r"\.m3u8$", re.I)
+DASH_RE = re.compile(r"\.mpd$", re.I)
 
 
 def default_dir():
@@ -134,6 +138,110 @@ def unique_path(directory, name):
         path = os.path.join(directory, f"{base} ({i}){ext}")
         i += 1
     return path
+
+
+def _iso_seconds(text):
+    """ISO 8601 duration such as PT1H2M3.5S -> seconds (0 when absent or unparseable)."""
+    m = re.fullmatch(r"P(?:\d+Y)?(?:\d+M)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?)?", text or "")
+    if not m:
+        return 0.0
+    d, h, mi, sec = (float(x or 0) for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + sec
+
+
+def parse_mpd(text, base_url):
+    """DASH manifest -> {"video": track, "audio": track}; track = {"bandwidth", "id", "urls"}.
+
+    Picks the highest-bandwidth representation of each kind from the first Period. urls lists the
+    initialization segment (if any) followed by the media segments, in order. Raises RuntimeError
+    for live streams and DRM, which cannot be downloaded.
+    """
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise RuntimeError(f"manifest DASH rusak: {e}") from e
+    local = lambda e: e.tag.rsplit("}", 1)[-1]
+    kids = lambda e, name: [c for c in e if local(c) == name]
+    first = lambda e, name: next(iter(kids(e, name)), None)
+    if root.get("type") == "dynamic":
+        raise RuntimeError("stream live tidak didukung")
+    period = first(root, "Period")
+    if period is None:
+        raise RuntimeError("manifest DASH tanpa Period")
+    duration = _iso_seconds(period.get("duration")) or _iso_seconds(root.get("mediaPresentationDuration"))
+    tracks = {}
+    for aset in kids(period, "AdaptationSet"):
+        for rep in kids(aset, "Representation"):
+            mime = rep.get("mimeType") or aset.get("mimeType") or ""
+            kind = (rep.get("contentType") or aset.get("contentType") or mime.split("/")[0]).lower()
+            if kind not in ("video", "audio"):
+                continue
+            if kids(aset, "ContentProtection") or kids(rep, "ContentProtection"):
+                raise RuntimeError("video ber-DRM tidak bisa diunduh")
+            bw = int(rep.get("bandwidth") or 0)
+            if kind in tracks and tracks[kind]["bandwidth"] >= bw:
+                continue
+            base = base_url
+            for node in (root, period, aset, rep):
+                b = first(node, "BaseURL")
+                if b is not None and (b.text or "").strip():
+                    base = urljoin(base, b.text.strip())
+            tmpl = next((t for t in (first(rep, "SegmentTemplate"), first(aset, "SegmentTemplate"),
+                                     first(period, "SegmentTemplate")) if t is not None), None)
+            ids = {"RepresentationID": rep.get("id") or "", "Bandwidth": str(bw)}
+            if tmpl is not None:
+                urls = _template_urls(tmpl, ids, base, duration, first)
+            else:
+                lst = first(rep, "SegmentList") or first(aset, "SegmentList")
+                if lst is not None:
+                    init = first(lst, "Initialization")
+                    urls = ([urljoin(base, init.get("sourceURL"))] if init is not None and init.get("sourceURL") else []) + \
+                           [urljoin(base, u.get("media")) for u in kids(lst, "SegmentURL") if u.get("media")]
+                else:
+                    urls = [base]  # a single file (BaseURL / SegmentBase)
+            if urls:
+                tracks[kind] = {"bandwidth": bw, "id": rep.get("id"), "urls": urls}
+    if not tracks:
+        raise RuntimeError("manifest DASH tidak berisi video atau audio")
+    return tracks
+
+
+def _template_urls(tmpl, ids, base, duration, first):
+    scale = int(tmpl.get("timescale") or 1)
+    number = int(tmpl.get("startNumber") or 1)
+
+    def fill(pattern, **extra):
+        def sub(m):
+            name, fmt = m.group(1), m.group(2)
+            if name == "":
+                return "$"
+            val = {**ids, **extra}[name]
+            return (f"%{fmt[1:]}" % int(val)) if fmt else str(val)
+        return urljoin(base, re.sub(r"\$(\w*)(%0\d+d)?\$", sub, pattern))
+
+    urls = []
+    if tmpl.get("initialization"):
+        urls.append(fill(tmpl.get("initialization")))
+    media = tmpl.get("media")
+    if not media:
+        return urls
+    timeline = first(tmpl, "SegmentTimeline")
+    if timeline is not None:
+        t = 0
+        for s in (c for c in timeline if c.tag.rsplit("}", 1)[-1] == "S"):
+            t = int(s.get("t") or t)
+            d, r = int(s.get("d")), int(s.get("r") or 0)
+            if r < 0:  # repeat until the end of the Period
+                r = max(0, math.ceil((duration * scale - t) / d) - 1)
+            for _ in range(r + 1):
+                urls.append(fill(media, Number=number, Time=t))
+                number, t = number + 1, t + d
+    elif tmpl.get("duration"):
+        if not duration:
+            raise RuntimeError("manifest DASH tanpa durasi")
+        count = math.ceil(duration * scale / int(tmpl.get("duration")))
+        urls += [fill(media, Number=number + i, Time=i * int(tmpl.get("duration"))) for i in range(count)]
+    return urls
 
 
 class Download:
@@ -353,9 +461,10 @@ class Download:
 
     def _run(self):
         try:
-            if self.hls or HLS_RE.search(urlsplit(self.url).path):
-                self.hls = True
-                self._run_hls()
+            path = urlsplit(self.url).path
+            if self.hls or HLS_RE.search(path) or DASH_RE.search(path):
+                self.hls = True  # segment-based progress
+                (self._run_dash if DASH_RE.search(path) else self._run_hls)()
                 return
             if not self.segs:
                 self._probe()
@@ -414,11 +523,24 @@ class Download:
             raise RuntimeError("playlist kosong")
         if not self.path:
             os.makedirs(self.directory, exist_ok=True)
-            strip_ext = lambda n: re.sub(r"\.(m3u8|ts|mp4)$", "", n, flags=re.I)  # keep dots in titles like "Film 2.0"
-            name = strip_ext(self.name or "") or strip_ext(unquote(os.path.basename(urlsplit(self.url).path))) or "video"
-            self.path = unique_path(self.directory, name + (".mp4" if init else ".ts"))
+            self.path = unique_path(self.directory, self._stem() + (".mp4" if init else ".ts"))
             self.name = os.path.basename(self.path)
         work = self.path + ".hls"
+        files = self._fetch_parts(urls, work)
+        if files is None:
+            return
+        with open(self.path + ".part", "wb") as out:
+            for f in files:
+                with open(f, "rb") as src:
+                    shutil.copyfileobj(src, out, 1 << 20)
+        os.replace(self.path + ".part", self.path)
+        shutil.rmtree(work, ignore_errors=True)
+        self.size = os.path.getsize(self.path)
+        self.status = "done"
+        self.start_verify()
+
+    def _fetch_parts(self, urls, work):
+        """Download every URL into work/NNNNNN, skipping finished ones. Returns the file list, or None if stopped."""
         os.makedirs(work, exist_ok=True)
         files = [os.path.join(work, f"{i:06d}") for i in range(len(urls))]
         self.seg_total = len(urls)
@@ -463,18 +585,54 @@ class Download:
         for w in workers:
             w.join()
         if self._stop.is_set():
-            return
+            return None
         if errors:
             raise errors[0]
-        with open(self.path + ".part", "wb") as out:
-            for f in files:
-                with open(f, "rb") as src:
-                    shutil.copyfileobj(src, out, 1 << 20)
-        os.replace(self.path + ".part", self.path)
+        return files
+
+    def _run_dash(self):
+        """Download a static DASH stream; join the segments per track and mux audio+video with ffmpeg."""
+        tracks = parse_mpd(self._fetch_text(self.url), self.url)
+        order = [k for k in ("video", "audio") if k in tracks]
+        if len(order) == 2 and not shutil.which("ffmpeg"):
+            raise RuntimeError("butuh ffmpeg untuk menggabung audio+video: sudo apt install ffmpeg")
+        if not self.path:
+            os.makedirs(self.directory, exist_ok=True)
+            self.path = unique_path(self.directory, self._stem() + ".mp4")
+            self.name = os.path.basename(self.path)
+        work = self.path + ".hls"
+        urls = [u for k in order for u in tracks[k]["urls"]]
+        files = self._fetch_parts(urls, work)
+        if files is None:
+            return
+        joined, i = [], 0
+        for k in order:
+            n = len(tracks[k]["urls"])
+            dest = os.path.join(work, k + ".mp4")
+            with open(dest, "wb") as out:
+                for f in files[i:i + n]:
+                    with open(f, "rb") as src:
+                        shutil.copyfileobj(src, out, 1 << 20)
+            joined.append(dest)
+            i += n
+        part = self.path + ".part"
+        if len(joined) == 1:
+            os.replace(joined[0], part)
+        else:
+            cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", joined[0], "-i", joined[1],
+                   "-c", "copy", "-f", "mp4", "-movflags", "+faststart", part]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode:
+                raise RuntimeError("ffmpeg gagal: " + (r.stderr.strip().splitlines() or ["?"])[-1])
+        os.replace(part, self.path)
         shutil.rmtree(work, ignore_errors=True)
         self.size = os.path.getsize(self.path)
         self.status = "done"
         self.start_verify()
+
+    def _stem(self):
+        strip_ext = lambda n: re.sub(r"\.(m3u8|mpd|ts|mp4)$", "", n, flags=re.I)  # keep dots in titles like "Film 2.0"
+        return strip_ext(self.name or "") or strip_ext(unquote(os.path.basename(urlsplit(self.url).path))) or "video"
 
     def _run_segments(self):
         fd = os.open(self.path + ".part", os.O_RDWR | os.O_CREAT)
