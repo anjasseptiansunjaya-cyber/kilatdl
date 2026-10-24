@@ -1143,6 +1143,14 @@ def run_gui(urls, background=False):
             mgr.schedule()
             for r in self.rows.values():
                 r.refresh()
+            self.stats.set_text(self.summary())
+            if self.get_application().tray:
+                self.get_application().tray.refresh()
+            if int(time.time()) % 5 == 0:
+                mgr.save()
+            return True
+
+        def summary(self):
             active = [d for d in mgr.items if d.status == "downloading"]
             queued = sum(d.status == "queued" for d in mgr.items)
             done = sum(d.status == "done" for d in mgr.items)
@@ -1151,10 +1159,20 @@ def run_gui(urls, background=False):
                 parts.append("↓ " + human(sum(d.speed for d in active), "/s"))
             if settings["limit_kbps"]:
                 parts.append(f"batas {settings['limit_kbps']} KB/s")
-            self.stats.set_text("  •  ".join(parts))
-            if int(time.time()) % 5 == 0:
-                mgr.save()
-            return True
+            return "  •  ".join(parts)
+
+        def pause_all(self):
+            for d in mgr.items:
+                if d.status == "downloading":
+                    d.pause()
+                elif d.status == "queued":
+                    d.status = "paused"
+
+        def resume_all(self):
+            for d in mgr.items:
+                if d.status in ("paused", "error"):
+                    d.status, d.notified = "queued", False
+            mgr.schedule()
 
         # -- adding ----------------------------------------------------------
         def add_url(self, url, directory=None, headers=None, name=None, checksum=None):
@@ -1333,10 +1351,117 @@ def run_gui(urls, background=False):
             self.get_application().quit()
             return False
 
+    SNI_XML = """<node><interface name="org.kde.StatusNotifierItem">
+      <property name="Category" type="s" access="read"/><property name="Id" type="s" access="read"/>
+      <property name="Title" type="s" access="read"/><property name="Status" type="s" access="read"/>
+      <property name="IconName" type="s" access="read"/><property name="ItemIsMenu" type="b" access="read"/>
+      <property name="Menu" type="o" access="read"/><property name="WindowId" type="i" access="read"/>
+      <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+      <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+      <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+      <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
+      <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
+      <signal name="NewToolTip"/><signal name="NewStatus"><arg type="s"/></signal></interface></node>"""
+    MENU_XML = """<node><interface name="com.canonical.dbusmenu">
+      <property name="Version" type="u" access="read"/><property name="TextDirection" type="s" access="read"/>
+      <property name="Status" type="s" access="read"/><property name="IconThemePath" type="as" access="read"/>
+      <method name="GetLayout"><arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+        <arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/></method>
+      <method name="GetGroupProperties"><arg type="ai" direction="in"/><arg type="as" direction="in"/>
+        <arg type="a(ia{sv})" direction="out"/></method>
+      <method name="GetProperty"><arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+      <method name="Event"><arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/><arg type="u" direction="in"/></method>
+      <method name="EventGroup"><arg type="a(isvu)" direction="in"/><arg type="ai" direction="out"/></method>
+      <method name="AboutToShow"><arg type="i" direction="in"/><arg type="b" direction="out"/></method>
+      <method name="AboutToShowGroup"><arg type="ai" direction="in"/><arg type="ai" direction="out"/><arg type="ai" direction="out"/></method>
+      <signal name="LayoutUpdated"><arg type="u"/><arg type="i"/></signal>
+      <signal name="ItemsPropertiesUpdated"><arg type="a(ia{sv})"/><arg type="a(ia{sv}as)"/></signal></interface></node>"""
+
+    class Tray:
+        """Status icon in the top bar (StatusNotifierItem + dbusmenu, shown by GNOME's AppIndicator extension).
+
+        Quietly does nothing when no watcher is running. `actions` maps menu ids to callbacks:
+        1 open window, 2 pause all, 3 resume all, 9 quit. Item 5 is a read-only status line.
+        """
+
+        def __init__(self, actions, status_text):
+            self.actions, self.status_text, self.rev, self.conn = actions, status_text, 1, None
+            self.label = status_text()
+            self.menu_info = Gio.DBusNodeInfo.new_for_xml(MENU_XML).interfaces[0]
+            Gio.bus_own_name(Gio.BusType.SESSION, f"org.kde.StatusNotifierItem-{os.getpid()}-1",
+                             Gio.BusNameOwnerFlags.NONE, self.on_bus, None, None)
+
+        def on_bus(self, conn, name):
+            self.conn = conn
+            conn.register_object("/StatusNotifierItem", Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0],
+                                 self.item_call, self.item_prop, None)
+            conn.register_object("/MenuBar", self.menu_info, self.menu_call, self.menu_prop, None)
+            conn.call("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher", "org.kde.StatusNotifierWatcher",
+                      "RegisterStatusNotifierItem", GLib.Variant("(s)", (name,)), None, Gio.DBusCallFlags.NONE, 2000, None,
+                      lambda c, r: self._ignore(c, r))
+
+        @staticmethod
+        def _ignore(conn, res):
+            try:
+                conn.call_finish(res)
+            except GLib.Error:
+                pass  # no tray host on this desktop
+
+        def item_prop(self, _c, _s, _p, _i, prop):
+            tip = self.label
+            return {"Category": GLib.Variant("s", "ApplicationStatus"), "Id": GLib.Variant("s", "kilatdl"),
+                    "Title": GLib.Variant("s", "KilatDL"), "Status": GLib.Variant("s", "Active"),
+                    "IconName": GLib.Variant("s", ICON_NAME), "ItemIsMenu": GLib.Variant("b", False),
+                    "Menu": GLib.Variant("o", "/MenuBar"), "WindowId": GLib.Variant("i", 0),
+                    "ToolTip": GLib.Variant("(sa(iiay)ss)", ("", [], "KilatDL", tip))}.get(prop)
+
+        def item_call(self, _c, _s, _p, _i, method, _params, inv):
+            if method == "Activate":
+                self.actions[1]()
+            inv.return_value(None)
+
+        def layout(self):
+            item = lambda i, label, **kw: (i, {"label": GLib.Variant("s", label), **{k: GLib.Variant(*v) for k, v in kw.items()}}, [])
+            sep = (4, {"type": GLib.Variant("s", "separator")}, [])
+            sep2 = (6, {"type": GLib.Variant("s", "separator")}, [])
+            kids = [item(1, "Buka KilatDL"), item(2, "Jeda semua"), item(3, "Lanjutkan semua"), sep,
+                    item(5, self.label, enabled=("b", False)), sep2, item(9, "Keluar")]
+            return (0, {"children-display": GLib.Variant("s", "submenu")},
+                    [GLib.Variant("(ia{sv}av)", k) for k in kids])
+
+        def menu_prop(self, _c, _s, _p, _i, prop):
+            return {"Version": GLib.Variant("u", 3), "TextDirection": GLib.Variant("s", "ltr"),
+                    "Status": GLib.Variant("s", "normal"), "IconThemePath": GLib.Variant("as", [])}.get(prop)
+
+        def menu_call(self, _c, _s, _p, _i, method, params, inv):
+            if method == "GetLayout":
+                inv.return_value(GLib.Variant("(u(ia{sv}av))", (self.rev, self.layout())))
+            elif method == "GetGroupProperties":
+                inv.return_value(GLib.Variant("(a(ia{sv}))", ([],)))
+            elif method == "AboutToShow":
+                inv.return_value(GLib.Variant("(b)", (False,)))
+            elif method == "Event":
+                item_id, kind = params.unpack()[:2]
+                if kind == "clicked" and item_id in self.actions:
+                    self.actions[item_id]()
+                inv.return_value(None)
+            else:
+                inv.return_error_literal(Gio.dbus_error_quark(), Gio.DBusError.UNKNOWN_METHOD, "tidak didukung")
+
+        def refresh(self):
+            text = self.status_text()
+            if text == self.label or not self.conn:
+                return
+            self.label, self.rev = text, self.rev + 1
+            self.conn.emit_signal(None, "/MenuBar", "com.canonical.dbusmenu", "LayoutUpdated",
+                                  GLib.Variant("(ui)", (self.rev, 0)))
+            self.conn.emit_signal(None, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewToolTip", None)
+
     class App(Adw.Application):
         def __init__(self):
             super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
             self.win = None
+            self.tray = None
             for name in ("open-file", "open-folder"):
                 act = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
                 act.connect("activate", lambda _a, param: open_path(param.get_string()))
@@ -1355,6 +1480,8 @@ def run_gui(urls, background=False):
             if not self.win:
                 self.win = Window(self)
                 self.hold()  # keep running (downloads + browser bridge) when the window is closed
+                self.tray = Tray({1: self.win.present, 2: self.win.pause_all, 3: self.win.resume_all, 9: self.quit},
+                                 self.win.summary)
                 start_bridge(lambda url, headers, name: GLib.idle_add(lambda: self.win.add_url(url, None, headers, name) and False))
             quiet = "--background" in args
             for a in args:
