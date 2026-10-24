@@ -52,6 +52,17 @@ Ekstensi bicara ke KilatDL lewat `127.0.0.1:9614`. Jalur itu hanya menerima perm
   Tidur/mati selalu menampilkan hitung mundur 30 detik yang bisa dibatalkan, dan tidak pernah berjalan
   bila ada unduhan yang Anda jeda sendiri.
 
+## Folder otomatis dan pemindaian virus
+
+Keduanya dinyalakan di menu ☰ (atau `--sort` / `--scan` di mode terminal).
+
+- **Folder per jenis**: file masuk ke sub-folder `Video`, `Musik`, `Gambar`, `Dokumen`, `Arsip`, atau `Program`
+  di dalam folder tujuan. Jenis yang tidak dikenal tetap di folder utama. Bila Anda memilih folder sendiri
+  saat menambah unduhan, pilihan itu dihormati dan tidak dipisah.
+- **ClamAV**: setelah selesai, file dipindai dengan `clamdscan` (bila daemon jalan) atau `clamscan`.
+  Pasang dengan `sudo apt install clamav`. File yang terdeteksi hanya ditandai dan diberi notifikasi;
+  KilatDL tidak pernah menghapusnya sendiri.
+
 ## Data
 
 `~/.local/share/kilatdl/` berisi `queue.json` (dapat memuat cookie sesi, izin 0600) dan `settings.json`.

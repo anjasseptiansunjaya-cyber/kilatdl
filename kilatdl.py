@@ -66,6 +66,49 @@ class Limiter:
 LIMITER = Limiter()
 
 
+CATEGORIES = (
+    ("Video", "mp4 mkv webm mov m4v ts avi flv wmv mpg mpeg 3gp"),
+    ("Musik", "mp3 m4a aac ogg opus flac wav wma"),
+    ("Gambar", "jpg jpeg png gif webp svg bmp tiff heic"),
+    ("Dokumen", "pdf doc docx xls xlsx ppt pptx odt ods odp txt epub csv rtf"),
+    ("Arsip", "zip rar 7z tar gz xz bz2 zst tgz iso img dmg"),
+    ("Program", "exe msi deb rpm appimage apk sh run flatpak snap"),
+)
+SCAN = {"on": False}  # set from settings by the GUI: scan finished files with ClamAV
+
+
+def category_for(name):
+    """Sub-folder for a file name, or None when the type is unknown (stays in the main folder)."""
+    ext = os.path.splitext(name or "")[1].lstrip(".").lower()
+    return next((cat for cat, exts in CATEGORIES if ext in exts.split()), None)
+
+
+def scan_file(path):
+    """Scan one file with ClamAV. Returns ("clean" | "infected" | "error", detail)."""
+    cmds = []
+    if shutil.which("clamdscan"):  # fast when the daemon runs; exits 2 when it does not
+        cmds.append(["clamdscan", "--no-summary", "--fdpass", path])
+    if shutil.which("clamscan"):
+        cmds.append(["clamscan", "--no-summary", path])
+    if not cmds:
+        return "error", "ClamAV tidak terpasang (sudo apt install clamav)"
+    detail = ""
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            detail = str(e)
+            continue
+        if r.returncode == 0:
+            return "clean", ""
+        if r.returncode == 1:
+            m = re.search(r": (.+) FOUND", r.stdout)
+            return "infected", m[1] if m else "?"
+        out = (r.stderr.strip() or r.stdout.strip()).splitlines()
+        detail = out[-1] if out else ""
+    return "error", detail or "pemindaian gagal"
+
+
 AFTER_ACTIONS = {"none": "Tidak ada", "quit": "Keluar dari KilatDL", "suspend": "Tidurkan komputer",
                  "poweroff": "Matikan komputer"}
 HHMM = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
@@ -119,7 +162,7 @@ class Scheduler:
 
 
 def load_settings():
-    s = {"directory": default_dir(), "limit_kbps": 0, "parallel": 3, "after": "none",
+    s = {"directory": default_dir(), "limit_kbps": 0, "parallel": 3, "after": "none", "sort": False, "scan": False,
          "schedule": {"enabled": False, "start": "23:00", "stop": ""}}
     try:
         with open(SETTINGS_FILE) as f:
@@ -303,8 +346,11 @@ def _template_urls(tmpl, ids, base, duration, first):
 class Download:
     """One file. States: queued, downloading, paused, done, error, cancelled."""
 
-    def __init__(self, url, directory=None, segments=8, name=None, headers=None):
+    def __init__(self, url, directory=None, segments=8, name=None, headers=None, sort=False):
         self.url = url
+        self.sort = sort        # put the file in a sub-folder by type (Video, Arsip, ...)
+        self.scan = ""          # "", "scanning", "clean", "infected" or "error"
+        self.scan_detail = ""
         self.headers = headers or {}   # extra request headers (Cookie, Referer) from the browser
         self.directory = directory or default_dir()
         self.max_segments = segments
@@ -330,12 +376,14 @@ class Download:
     def to_dict(self):
         return {"url": self.url, "directory": self.directory, "segments": self.max_segments,
                 "name": self.name, "path": self.path, "status": self.status, "headers": self.headers,
-                "checksum": ":".join(self.checksum) if self.checksum else None, "verify": self.verify}
+                "checksum": ":".join(self.checksum) if self.checksum else None, "verify": self.verify,
+                "sort": self.sort, "scan": self.scan if self.scan != "scanning" else "", "scan_detail": self.scan_detail}
 
     @classmethod
     def from_dict(cls, d):
-        dl = cls(d["url"], d.get("directory"), d.get("segments", 8), d.get("name"), d.get("headers"))
+        dl = cls(d["url"], d.get("directory"), d.get("segments", 8), d.get("name"), d.get("headers"), d.get("sort", False))
         dl.path = d.get("path")
+        dl.scan, dl.scan_detail = d.get("scan", ""), d.get("scan_detail", "")
         if d.get("checksum"):
             dl.checksum, dl.verify = parse_checksum(d["checksum"]), d.get("verify", "")
         # a download still marked "downloading" means the app died mid-transfer: resume it
@@ -443,6 +491,18 @@ class Download:
         if self.checksum and self.status == "done":
             self.start_verify()
 
+    def finish(self):
+        self.start_verify()
+        if SCAN["on"]:
+            self.scan, self.scan_detail = "scanning", ""
+            threading.Thread(target=self._scan, daemon=True).start()
+
+    def _scan(self):
+        self.scan_detail = ""
+        state, detail = scan_file(self.path)
+        self.scan_detail = detail
+        self.scan = state
+
     def start_verify(self):
         if not (self.checksum and self.path and os.path.exists(self.path)):
             return
@@ -524,8 +584,7 @@ class Download:
                 return
             if not self.segs:
                 self._probe()
-                os.makedirs(self.directory, exist_ok=True)
-                self.path = self.path or unique_path(self.directory, self.name)
+                self.path = self.path or self._choose_path(self.name)
                 self.name = os.path.basename(self.path)
                 if self.resumable and self.size:
                     n = max(1, min(self.max_segments, self.size // MIN_SEGMENT))
@@ -545,7 +604,7 @@ class Download:
             if self.meta_path and os.path.exists(self.meta_path):
                 os.remove(self.meta_path)
             self.status = "done"
-            self.start_verify()
+            self.finish()
         except Exception as e:  # noqa: BLE001 - surface any failure to the UI
             if not self._stop.is_set():
                 self.status, self.error = "error", str(e) or e.__class__.__name__
@@ -578,8 +637,7 @@ class Download:
         if not urls:
             raise RuntimeError("playlist kosong")
         if not self.path:
-            os.makedirs(self.directory, exist_ok=True)
-            self.path = unique_path(self.directory, self._stem() + (".mp4" if init else ".ts"))
+            self.path = self._choose_path(self._stem() + (".mp4" if init else ".ts"))
             self.name = os.path.basename(self.path)
         work = self.path + ".hls"
         files = self._fetch_parts(urls, work)
@@ -593,7 +651,7 @@ class Download:
         shutil.rmtree(work, ignore_errors=True)
         self.size = os.path.getsize(self.path)
         self.status = "done"
-        self.start_verify()
+        self.finish()
 
     def _fetch_parts(self, urls, work):
         """Download every URL into work/NNNNNN, skipping finished ones. Returns the file list, or None if stopped."""
@@ -653,8 +711,7 @@ class Download:
         if len(order) == 2 and not shutil.which("ffmpeg"):
             raise RuntimeError("butuh ffmpeg untuk menggabung audio+video: sudo apt install ffmpeg")
         if not self.path:
-            os.makedirs(self.directory, exist_ok=True)
-            self.path = unique_path(self.directory, self._stem() + ".mp4")
+            self.path = self._choose_path(self._stem() + ".mp4")
             self.name = os.path.basename(self.path)
         work = self.path + ".hls"
         urls = [u for k in order for u in tracks[k]["urls"]]
@@ -684,7 +741,14 @@ class Download:
         shutil.rmtree(work, ignore_errors=True)
         self.size = os.path.getsize(self.path)
         self.status = "done"
-        self.start_verify()
+        self.finish()
+
+    def _choose_path(self, name):
+        target = self.directory
+        if self.sort and category_for(name):
+            target = os.path.join(target, category_for(name))
+        os.makedirs(target, exist_ok=True)
+        return unique_path(target, name)
 
     def _stem(self):
         strip_ext = lambda n: re.sub(r"\.(m3u8|mpd|ts|mp4)$", "", n, flags=re.I)  # keep dots in titles like "Film 2.0"
@@ -807,6 +871,8 @@ def status_text(d):
     if d.status == "done":
         mark = {"checking": " - memverifikasi checksum...", "ok": " - \u2713 checksum cocok",
                 "bad": " - \u2717 CHECKSUM TIDAK COCOK, file mungkin rusak"}.get(d.verify, "")
+        mark += {"scanning": " - memindai virus...", "clean": " - \u2713 bebas virus",
+                 "infected": f" - \u2717 VIRUS: {d.scan_detail}", "error": f" - pemindaian virus gagal ({d.scan_detail})"}.get(d.scan, "")
         return f"Selesai - {human(d.size)}{mark}"
     total = human(d.size) if d.size else "?"
     base = f"{human(d.downloaded)} / {total}"
@@ -819,8 +885,9 @@ def status_text(d):
 
 
 # ---------------------------------------------------------------- CLI
-def run_cli(urls, directory, segments, checksum=None):
-    items = [Download(u, directory, segments) for u in urls]
+def run_cli(urls, directory, segments, checksum=None, sort=False, scan=False):
+    SCAN["on"] = scan
+    items = [Download(u, directory, segments, sort=sort) for u in urls]
     if checksum:
         if len(items) != 1:
             print("--checksum hanya untuk satu URL", file=sys.stderr)
@@ -845,14 +912,15 @@ def run_cli(urls, directory, segments, checksum=None):
             d.pause()
         print("\nDijeda. Jalankan perintah yang sama untuk melanjutkan.")
         return 130
-    while any(d.verify == "checking" for d in items):
+    while any(d.verify == "checking" or d.scan == "scanning" for d in items):
         time.sleep(0.2)
     print()
     ok = True
     for d in items:
         extra = {"ok": " [checksum cocok]", "bad": " [CHECKSUM TIDAK COCOK]"}.get(d.verify, "")
+        extra += {"clean": " [bebas virus]", "infected": f" [VIRUS: {d.scan_detail}]", "error": f" [scan gagal: {d.scan_detail}]"}.get(d.scan, "")
         print(f"{'OK  ' if d.status == 'done' else 'GAGAL'} {d.path or d.url} {d.error}{extra}")
-        ok &= d.status == "done" and d.verify != "bad"
+        ok &= d.status == "done" and d.verify != "bad" and d.scan != "infected"
     return 0 if ok else 1
 
 
@@ -960,6 +1028,7 @@ def run_gui(urls, background=False):
     settings = load_settings()
     mgr = Manager(settings["parallel"])
     scheduler = Scheduler(settings)
+    SCAN["on"] = bool(settings["scan"]) and bool(shutil.which("clamscan") or shutil.which("clamdscan"))
     mgr.load()
     LIMITER.rate = settings["limit_kbps"] * 1024
 
@@ -1141,13 +1210,40 @@ def run_gui(urls, background=False):
             self.folder_btn = Gtk.Button()
             self.folder_btn.connect("clicked", lambda *_: self.pick_folder(self.set_default_dir))
             self.show_default_dir()
+            def switch_row(label, key, on_change=None):
+                sw = Gtk.Switch(active=bool(settings[key]), valign=Gtk.Align.CENTER)
+
+                def changed(_sw, state):
+                    if on_change and not on_change(state):
+                        GLib.idle_add(lambda: sw.set_active(False) and False)  # refused: put the switch back
+                        return True
+                    settings[key] = state
+                    save_settings(settings)
+                    sw.set_state(state)
+                    return True
+
+                sw.connect("state-set", changed)
+                row = Gtk.Box(spacing=8)
+                row.append(Gtk.Label(label=label, xalign=0, hexpand=True))
+                row.append(sw)
+                return row
+
+            def toggle_scan(state):
+                if state and not (shutil.which("clamscan") or shutil.which("clamdscan")):
+                    self.toasts.add_toast(Adw.Toast.new("ClamAV belum terpasang: sudo apt install clamav"))
+                    return False
+                SCAN["on"] = state
+                return True
+
+            sort_row = switch_row("Folder otomatis per jenis file", "sort")
+            scan_row = switch_row("Pindai virus (ClamAV)", "scan", toggle_scan)
             sched_btn = Gtk.Button(label="Jadwal & aksi akhir...")
             sched_btn.connect("clicked", lambda *_: (self.menu_pop.popdown(), self.ask_schedule()))
             quit_btn = Gtk.Button(label="Keluar dari KilatDL")
             quit_btn.add_css_class("destructive-action")
             quit_btn.connect("clicked", lambda *_: app.quit())
             for w in (row, hint, Gtk.Separator(), Gtk.Label(label="Folder tujuan", xalign=0), self.folder_btn,
-                      Gtk.Separator(), sched_btn, Gtk.Separator(), quit_btn):
+                      sort_row, scan_row, Gtk.Separator(), sched_btn, Gtk.Separator(), quit_btn):
                 box.append(w)
             self.menu_pop = Gtk.Popover(child=box)
             return self.menu_pop
@@ -1336,7 +1432,8 @@ def run_gui(urls, background=False):
             url = url.strip()
             if not re.match(r"https?://", url):
                 return False
-            dl = Download(url, directory or settings["directory"], name=name, headers=headers)
+            sort = settings["sort"] and directory in (None, settings["directory"])  # a folder picked by hand is respected
+            dl = Download(url, directory or settings["directory"], name=name, headers=headers, sort=sort)
             if checksum:
                 dl.set_checksum(checksum)
             mgr.add(dl)
@@ -1464,7 +1561,7 @@ def run_gui(urls, background=False):
             for d in mgr.items:
                 if d.notified:
                     continue
-                finished = d.status == "done" and (not d.checksum or d.verify in ("ok", "bad"))
+                finished = d.status == "done" and (not d.checksum or d.verify in ("ok", "bad")) and d.scan != "scanning"
                 if not (finished or d.status == "error"):
                     continue
                 d.notified = True
@@ -1473,9 +1570,10 @@ def run_gui(urls, background=False):
                     note.set_body(f"{d.name or d.url}\n{d.error}")
                     note.set_icon(Gio.ThemedIcon.new("dialog-error-symbolic"))
                 else:
-                    bad = d.verify == "bad"
-                    note = Gio.Notification.new("Checksum tidak cocok!" if bad else "Unduhan selesai")
-                    note.set_body(f"{d.name}\n{human(d.size)}" + (" - file mungkin rusak" if bad else ""))
+                    virus = d.scan == "infected"
+                    bad = d.verify == "bad" or virus
+                    note = Gio.Notification.new("Virus terdeteksi!" if virus else "Checksum tidak cocok!" if bad else "Unduhan selesai")
+                    note.set_body(f"{d.name}\n" + (f"{d.scan_detail} - jangan dibuka" if virus else human(d.size) + (" - file mungkin rusak" if bad else "")))
                     note.set_icon(Gio.ThemedIcon.new("dialog-warning-symbolic" if bad else ICON_NAME))
                     note.add_button_with_target("Buka file", "app.open-file", GLib.Variant("s", d.path))
                     note.add_button_with_target("Buka folder", "app.open-folder", GLib.Variant("s", os.path.dirname(d.path)))
@@ -1664,12 +1762,14 @@ def main():
     p.add_argument("-o", "--output", default=default_dir(), help="folder tujuan (mode terminal)")
     p.add_argument("-n", "--segments", type=int, default=8, help="jumlah koneksi per file (default 8)")
     p.add_argument("--checksum", help="hash yang harus cocok, mis. sha256:ab12... (satu URL, mode terminal)")
+    p.add_argument("--sort", action="store_true", help="simpan di sub-folder per jenis file (mode terminal)")
+    p.add_argument("--scan", action="store_true", help="pindai dengan ClamAV setelah selesai (mode terminal)")
     p.add_argument("--gui", action="store_true", help="paksa buka GUI")
     p.add_argument("--background", action="store_true", help="jalan tanpa membuka jendela (untuk autostart)")
     a = p.parse_args()
     if a.gui or a.background or not a.urls:
         return run_gui(a.urls, a.background)
-    return run_cli(a.urls, a.output, max(1, a.segments), a.checksum)
+    return run_cli(a.urls, a.output, max(1, a.segments), a.checksum, a.sort, a.scan)
 
 
 if __name__ == "__main__":
