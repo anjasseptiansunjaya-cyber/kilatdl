@@ -5,13 +5,20 @@ here="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p ~/.local/bin ~/.local/share/applications
 install -m 755 "$here/kilatdl.py" ~/.local/bin/kilatdl
 install -m 755 "$here/kilatbrowser.py" ~/.local/bin/kilatbrowser
+mkdir -p ~/.local/share/icons/hicolor/scalable/apps
+install -m 644 "$here/assets/kilatdl.svg" ~/.local/share/icons/hicolor/scalable/apps/id.anjas.KilatDL.svg
+for size in 16 32 48 96 128 256; do
+  mkdir -p ~/.local/share/icons/hicolor/${size}x${size}/apps
+  install -m 644 "$here/assets/kilatdl-${size}.png" ~/.local/share/icons/hicolor/${size}x${size}/apps/id.anjas.KilatDL.png
+done
+gtk-update-icon-cache -q -t ~/.local/share/icons/hicolor 2>/dev/null || true
 cat > ~/.local/share/applications/kilatbrowser.desktop <<DESK2
 [Desktop Entry]
 Type=Application
 Name=KilatBrowser
 Comment=Browser ringan dengan unduhan lewat KilatDL
 Exec=$HOME/.local/bin/kilatbrowser %U
-Icon=web-browser
+Icon=id.anjas.KilatDL
 Terminal=false
 Categories=Network;WebBrowser;
 DESK2
@@ -22,7 +29,7 @@ Type=Application
 Name=KilatDL
 Comment=Download manager multi-koneksi
 Exec=$HOME/.local/bin/kilatdl %U
-Icon=folder-download
+Icon=id.anjas.KilatDL
 Terminal=false
 Categories=Network;FileTransfer;
 MimeType=x-scheme-handler/http;x-scheme-handler/https;

@@ -91,7 +91,7 @@ def main():
         xpi = os.path.join(profile, "extensions", "kilatdl@anjas.local.xpi")
         import zipfile
         with zipfile.ZipFile(xpi, "w", zipfile.ZIP_DEFLATED) as z:
-            for name in ("manifest.json", "background.js", "content.js", "popup.html", "popup.js"):
+            for name in ("manifest.json", "background.js", "content.js", "popup.html", "popup.js", *[f"icons/icon-{n}.png" for n in (16, 32, 48, 96, 128)]):
                 z.write(os.path.join(ROOT, "extension", name), name)
 
         fx_env = dict(os.environ, MOZ_REMOTE_ALLOW_SYSTEM_ACCESS="1")

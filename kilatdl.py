@@ -21,6 +21,7 @@ import urllib.request
 from urllib.parse import unquote, urljoin, urlsplit
 
 APP_ID = os.environ.get("KILATDL_APP_ID", "id.anjas.KilatDL")
+ICON_NAME = "id.anjas.KilatDL"  # installed by install.sh (assets/kilatdl.svg)
 UA = "Mozilla/5.0 (X11; Linux x86_64) KilatDL/1.0"
 MIN_SEGMENT = 1 << 20
 CHUNK = 1 << 16
@@ -872,7 +873,8 @@ def run_gui(urls, background=False):
             scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
             scroll.set_child(Adw.Clamp(maximum_size=820, tightening_threshold=620, child=self.list))
 
-            empty = Adw.StatusPage(icon_name="folder-download-symbolic", title="Belum ada unduhan",
+            has_logo = Gtk.IconTheme.get_for_display(Gdk.Display.get_default()).has_icon(ICON_NAME)
+            empty = Adw.StatusPage(icon_name=ICON_NAME if has_logo else "folder-download-symbolic", title="Belum ada unduhan",
                                    description="Tempel link dengan Ctrl+V, tarik tautan ke jendela ini,\natau klik Tambah.")
             self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
             self.stack.add_named(empty, "empty")
@@ -1141,7 +1143,7 @@ def run_gui(urls, background=False):
                     bad = d.verify == "bad"
                     note = Gio.Notification.new("Checksum tidak cocok!" if bad else "Unduhan selesai")
                     note.set_body(f"{d.name}\n{human(d.size)}" + (" - file mungkin rusak" if bad else ""))
-                    note.set_icon(Gio.ThemedIcon.new("dialog-warning-symbolic" if bad else "folder-download"))
+                    note.set_icon(Gio.ThemedIcon.new("dialog-warning-symbolic" if bad else ICON_NAME))
                     note.add_button_with_target("Buka file", "app.open-file", GLib.Variant("s", d.path))
                     note.add_button_with_target("Buka folder", "app.open-folder", GLib.Variant("s", os.path.dirname(d.path)))
                     note.set_default_action_and_target("app.open-folder", GLib.Variant("s", os.path.dirname(d.path)))
@@ -1184,6 +1186,7 @@ def run_gui(urls, background=False):
 
         def do_startup(self):
             Adw.Application.do_startup(self)
+            Gtk.Window.set_default_icon_name(ICON_NAME)
             provider = Gtk.CssProvider()
             provider.load_from_data(CSS)
             Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider,

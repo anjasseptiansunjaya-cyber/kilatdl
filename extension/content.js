@@ -37,7 +37,7 @@
       .go[disabled] { background: #3a7d44; cursor: default; }
     </style>
     <button id="btn" type="button" aria-label="Unduh video dengan KilatDL">
-      <svg viewBox="0 0 24 24"><path d="M12 3v12m0 0l-5-5m5 5l5-5M5 20h14"/></svg><span>Unduh video</span>
+      <svg viewBox="0 0 24 24"><path d="M13.5 2 5 13.5h6L10 22l9-12h-6z" fill="currentColor" stroke="none"/></svg><span>Unduh video</span>
     </button>
     <div id="menu" hidden></div>`;
   const btn = root.getElementById("btn");
