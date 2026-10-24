@@ -1,0 +1,1038 @@
+#!/usr/bin/env python3
+"""KilatDL - multi-connection download manager (GTK4 GUI + CLI).
+
+Usage:
+    kilatdl                     open the GUI
+    kilatdl URL [URL ...]       download in the terminal
+    kilatdl --gui URL           open the GUI with URL queued
+"""
+import argparse
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import unquote, urljoin, urlsplit
+
+APP_ID = os.environ.get("KILATDL_APP_ID", "id.anjas.KilatDL")
+UA = "Mozilla/5.0 (X11; Linux x86_64) KilatDL/1.0"
+MIN_SEGMENT = 1 << 20
+CHUNK = 1 << 16
+RETRIES = 6
+DATA_DIR = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "kilatdl")
+QUEUE_FILE = os.path.join(DATA_DIR, "queue.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+BRIDGE_PORT = int(os.environ.get("KILATDL_PORT", "9614"))
+FATAL_HTTP = (401, 403, 404, 410)  # retrying will not help; usually an expired or forbidden link
+HLS_RE = re.compile(r"\.m3u8$", re.I)
+
+
+def default_dir():
+    d = os.path.expanduser("~/Downloads")
+    return d if os.path.isdir(d) else os.path.expanduser("~")
+
+
+class Limiter:
+    """Global bandwidth cap shared by every connection (bytes/s, 0 = unlimited)."""
+
+    def __init__(self):
+        self.rate = 0
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def consume(self, n):
+        rate = self.rate
+        if rate <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            start = max(self._next, now)
+            self._next = start + n / rate
+        if start > now:
+            time.sleep(start - now)
+
+
+LIMITER = Limiter()
+
+
+def load_settings():
+    s = {"directory": default_dir(), "limit_kbps": 0, "parallel": 3}
+    try:
+        with open(SETTINGS_FILE) as f:
+            s.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    if not os.path.isdir(s["directory"]):
+        s["directory"] = default_dir()
+    return s
+
+
+def save_settings(s):
+    write_private(SETTINGS_FILE, s)
+
+
+def write_private(path, obj):
+    """Write JSON readable only by the owner (the queue can hold cookies)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(obj, f, indent=1)
+    os.replace(tmp, path)
+
+
+HASH_BY_LEN = {32: "md5", 40: "sha1", 64: "sha256", 128: "sha512"}
+
+
+def parse_checksum(text):
+    """'sha256:ab12..' or a bare hex digest -> (algorithm, lowercase hex). Raises ValueError."""
+    text = (text or "").strip().lower()
+    algo, _, digest = text.rpartition(":")
+    digest = digest.split()[0] if digest.split() else ""
+    if not re.fullmatch(r"[0-9a-f]+", digest) or len(digest) not in HASH_BY_LEN:
+        raise ValueError("checksum harus heksadesimal 32/40/64/128 karakter (MD5/SHA-1/SHA-256/SHA-512)")
+    algo = algo or HASH_BY_LEN[len(digest)]
+    if algo not in hashlib.algorithms_available or hashlib.new(algo).digest_size * 2 != len(digest):
+        raise ValueError(f"algoritma {algo} tidak cocok dengan panjang checksum")
+    return algo, digest
+
+
+def human(n, suffix=""):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}{suffix}" if unit == "B" else f"{n:.1f} {unit}{suffix}"
+        n /= 1024
+
+
+def filename_from(resp, url):
+    cd = resp.headers.get("Content-Disposition", "")
+    m = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", cd, re.I)
+    if m:
+        name = unquote(m.group(1).strip())
+    else:
+        m = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, re.I)
+        name = m.group(1).strip() if m else ""
+    if not name:
+        name = unquote(os.path.basename(urlsplit(url).path))
+    name = os.path.basename(name.replace("\\", "/")).strip().lstrip(".")
+    return name or "download"
+
+
+def unique_path(directory, name):
+    path = os.path.join(directory, name)
+    base, ext = os.path.splitext(name)
+    i = 1
+    while os.path.exists(path) or os.path.exists(path + ".part"):
+        path = os.path.join(directory, f"{base} ({i}){ext}")
+        i += 1
+    return path
+
+
+class Download:
+    """One file. States: queued, downloading, paused, done, error, cancelled."""
+
+    def __init__(self, url, directory=None, segments=8, name=None, headers=None):
+        self.url = url
+        self.headers = headers or {}   # extra request headers (Cookie, Referer) from the browser
+        self.directory = directory or default_dir()
+        self.max_segments = segments
+        self.name = name
+        self.path = None
+        self.size = 0
+        self.segs = []          # [start, end, pos]; end inclusive
+        self.streamed = 0       # bytes received when size/ranges are unknown
+        self.hls = False        # HLS playlist: segments are fetched, then joined
+        self.seg_total = self.seg_done = self.hls_bytes = 0
+        self.checksum = None    # (algorithm, hex digest) the finished file must match
+        self.verify = ""        # "", "checking", "ok" or "bad"
+        self.notified = False   # GUI: completion notification already shown
+        self.resumable = False
+        self.status = "queued"
+        self.error = ""
+        self.speed = 0.0
+        self._stop = threading.Event()
+        self._thread = None
+        self._last = (time.monotonic(), 0)
+
+    # -- persistence ------------------------------------------------------
+    def to_dict(self):
+        return {"url": self.url, "directory": self.directory, "segments": self.max_segments,
+                "name": self.name, "path": self.path, "status": self.status, "headers": self.headers,
+                "checksum": ":".join(self.checksum) if self.checksum else None, "verify": self.verify}
+
+    @classmethod
+    def from_dict(cls, d):
+        dl = cls(d["url"], d.get("directory"), d.get("segments", 8), d.get("name"), d.get("headers"))
+        dl.path = d.get("path")
+        if d.get("checksum"):
+            dl.checksum, dl.verify = parse_checksum(d["checksum"]), d.get("verify", "")
+        # a download still marked "downloading" means the app died mid-transfer: resume it
+        saved = d.get("status")
+        dl.status = "done" if saved == "done" else "queued" if saved in ("downloading", "queued") else "paused"
+        if dl.status == "done" and dl.path and os.path.exists(dl.path):
+            dl.size = os.path.getsize(dl.path)
+            dl.segs = [[0, dl.size - 1, dl.size]]
+        elif dl.status == "done":
+            dl.status = "paused"
+        dl._load_meta()
+        dl.notified = dl.status == "done"
+        if dl.status == "done" and dl.checksum and dl.verify not in ("ok", "bad"):
+            dl.start_verify()
+        return dl
+
+    @property
+    def meta_path(self):
+        return self.path + ".kdl" if self.path else None
+
+    def _save_meta(self):
+        if self.path and self.resumable:
+            tmp = self.meta_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"url": self.url, "size": self.size, "segs": self.segs}, f)
+            os.replace(tmp, self.meta_path)
+
+    def _load_meta(self):
+        if self.status == "done" or not self.path or not os.path.exists(self.meta_path):
+            return
+        try:
+            with open(self.meta_path) as f:
+                m = json.load(f)
+            if m["url"] == self.url and os.path.exists(self.path + ".part"):
+                self.size, self.segs, self.resumable = m["size"], m["segs"], True
+        except (OSError, ValueError, KeyError):
+            pass
+
+    # -- progress ---------------------------------------------------------
+    @property
+    def downloaded(self):
+        if self.hls:
+            return self.hls_bytes
+        if self.resumable:
+            return sum(min(p, e + 1) - s for s, e, p in self.segs)
+        return self.streamed
+
+    @property
+    def fraction(self):
+        if self.hls:
+            return 1.0 if self.status == "done" else self.seg_done / self.seg_total if self.seg_total else 0.0
+        return min(1.0, self.downloaded / self.size) if self.size else 0.0
+
+    def tick(self):
+        now, done = time.monotonic(), self.downloaded
+        t0, d0 = self._last
+        if now - t0 >= 0.5:
+            inst = max(0, done - d0) / (now - t0)
+            self.speed = inst if self.speed == 0 else self.speed * 0.6 + inst * 0.4
+            self._last = (now, done)
+        if self.status != "downloading":
+            self.speed = 0.0
+
+    @property
+    def eta(self):
+        if self.status == "downloading" and self.speed > 1 and self.size:
+            return int((self.size - self.downloaded) / self.speed)
+        return None
+
+    # -- control ----------------------------------------------------------
+    def start(self):
+        if self.status in ("downloading", "done"):
+            return
+        self._stop.clear()
+        self.status, self.error = "downloading", ""
+        self._last = (time.monotonic(), self.downloaded)
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def pause(self):
+        if self.status == "downloading":
+            self._stop.set()
+            self.status = "paused"
+
+    def cancel(self, delete_files=True):
+        self._stop.set()
+        self.status = "cancelled"
+        if delete_files and self.path and not os.path.exists(self.path):
+            for p in (self.path + ".part", self.meta_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            shutil.rmtree(self.path + ".hls", ignore_errors=True)
+
+    def join(self):
+        if self._thread:
+            self._thread.join()
+
+    # -- checksum ---------------------------------------------------------
+    def set_checksum(self, text):
+        """Set (or clear, with empty text) the expected digest; verifies at once if already finished."""
+        self.checksum = parse_checksum(text) if text and text.strip() else None
+        self.verify = ""
+        if self.checksum and self.status == "done":
+            self.start_verify()
+
+    def start_verify(self):
+        if not (self.checksum and self.path and os.path.exists(self.path)):
+            return
+        self.verify = "checking"
+        threading.Thread(target=self._verify, daemon=True).start()
+
+    def _verify(self):
+        algo, want = self.checksum
+        try:
+            h = hashlib.new(algo)
+            with open(self.path, "rb") as f:
+                while block := f.read(1 << 20):
+                    h.update(block)
+            self.verify = "ok" if h.hexdigest() == want else "bad"
+        except OSError:
+            self.verify = ""
+
+    # -- expired links ----------------------------------------------------
+    def replace_url(self, new_url, headers=None):
+        """Point an unfinished download at a fresh link for the same file; progress is kept."""
+        if self.status == "downloading":
+            raise ValueError("jeda unduhannya dulu")
+        if self.status == "done":
+            raise ValueError("unduhan sudah selesai")
+        if self.hls:
+            raise ValueError("ganti link belum didukung untuk HLS")
+        old = self.headers
+        if headers is not None:
+            self.headers = headers
+        try:
+            with self._open(new_url, 0, 0) as r:
+                final = r.geturl()
+                m = re.match(r"bytes\s+0-0/(\d+)", r.headers.get("Content-Range", ""))
+                ranges = r.status == 206 and bool(m)
+                size = int(m[1]) if ranges else int(r.headers.get("Content-Length") or 0)
+        except (OSError, ValueError) as e:
+            self.headers = old
+            if isinstance(e, urllib.error.HTTPError):
+                e.close()
+            raise ValueError(f"link baru tidak bisa dibuka: {e}") from e
+        if self.size and size != self.size:
+            self.headers = old
+            raise ValueError(f"ukuran berbeda ({human(size)} vs {human(self.size)}); itu bukan file yang sama")
+        if self.resumable and not ranges:
+            self.headers = old
+            raise ValueError("server link baru tidak mendukung lanjut (Range)")
+        self.url, self.error = final, ""
+        if self.status == "error":
+            self.status = "paused"
+        self._save_meta()
+
+    # -- engine -----------------------------------------------------------
+    def _open(self, url, start=None, end=None):
+        hdrs = {"User-Agent": UA, "Accept-Encoding": "identity", **self.headers}
+        req = urllib.request.Request(url, headers=hdrs)
+        if start is not None:
+            req.add_header("Range", f"bytes={start}-{end if end is not None else ''}")
+        return urllib.request.urlopen(req, timeout=30)
+
+    def _probe(self):
+        with self._open(self.url, 0, 0) as r:
+            self.url = r.geturl()
+            if not self.name:
+                self.name = filename_from(r, self.url)
+            cr = r.headers.get("Content-Range", "")
+            m = re.match(r"bytes\s+0-0/(\d+)", cr)
+            if r.status == 206 and m:
+                self.size, self.resumable = int(m.group(1)), True
+            else:
+                self.size = int(r.headers.get("Content-Length") or 0)
+                self.resumable = False
+
+    def _run(self):
+        try:
+            if self.hls or HLS_RE.search(urlsplit(self.url).path):
+                self.hls = True
+                self._run_hls()
+                return
+            if not self.segs:
+                self._probe()
+                os.makedirs(self.directory, exist_ok=True)
+                self.path = self.path or unique_path(self.directory, self.name)
+                self.name = os.path.basename(self.path)
+                if self.resumable and self.size:
+                    n = max(1, min(self.max_segments, self.size // MIN_SEGMENT))
+                    step = -(-self.size // n)
+                    self.segs = [[i * step, min(self.size, (i + 1) * step) - 1, i * step] for i in range(n)]
+                else:
+                    self.resumable = False
+                    self.segs = []
+            self.streamed = 0
+            if self.resumable:
+                self._run_segments()
+            else:
+                self._run_stream()
+            if self._stop.is_set():
+                return
+            os.replace(self.path + ".part", self.path)
+            if self.meta_path and os.path.exists(self.meta_path):
+                os.remove(self.meta_path)
+            self.status = "done"
+            self.start_verify()
+        except Exception as e:  # noqa: BLE001 - surface any failure to the UI
+            if not self._stop.is_set():
+                self.status, self.error = "error", str(e) or e.__class__.__name__
+                if isinstance(e, urllib.error.HTTPError) and e.code in FATAL_HTTP:
+                    self.error = f"HTTP {e.code} - link mungkin kedaluwarsa, pakai 'Ganti link'"
+
+    def _fetch_text(self, url):
+        with self._open(url) as r:
+            return r.read(8 << 20).decode("utf-8", "replace")
+
+    def _run_hls(self):
+        """Download an unencrypted VOD HLS stream and join its segments into one file."""
+        base, text = self.url, self._fetch_text(self.url)
+        for _ in range(3):  # master playlist -> best variant
+            lines = text.splitlines()
+            variants = [(int((re.search(r"BANDWIDTH=(\d+)", l) or [0, 0])[1]), nxt)
+                        for l, nxt in zip(lines, lines[1:] + [""]) if l.startswith("#EXT-X-STREAM-INF")]
+            if not variants:
+                break
+            uri = next(x for x in lines[lines.index(max(variants)[1]):] if x and not x.startswith("#"))
+            base = urljoin(base, uri)
+            text = self._fetch_text(base)
+        if re.search(r"#EXT-X-KEY:(?!.*METHOD=NONE)", text):
+            raise RuntimeError("HLS terenkripsi (AES/DRM) belum didukung")
+        if "#EXT-X-ENDLIST" not in text:
+            raise RuntimeError("stream live tidak didukung")
+        init = re.search(r'#EXT-X-MAP:.*URI="([^"]+)"', text)
+        urls = ([urljoin(base, init.group(1))] if init else []) + \
+               [urljoin(base, l.strip()) for l in text.splitlines() if l.strip() and not l.startswith("#")]
+        if not urls:
+            raise RuntimeError("playlist kosong")
+        if not self.path:
+            os.makedirs(self.directory, exist_ok=True)
+            strip_ext = lambda n: re.sub(r"\.(m3u8|ts|mp4)$", "", n, flags=re.I)  # keep dots in titles like "Film 2.0"
+            name = strip_ext(self.name or "") or strip_ext(unquote(os.path.basename(urlsplit(self.url).path))) or "video"
+            self.path = unique_path(self.directory, name + (".mp4" if init else ".ts"))
+            self.name = os.path.basename(self.path)
+        work = self.path + ".hls"
+        os.makedirs(work, exist_ok=True)
+        files = [os.path.join(work, f"{i:06d}") for i in range(len(urls))]
+        self.seg_total = len(urls)
+        self.seg_done = sum(os.path.exists(f) for f in files)
+        self.hls_bytes = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+        self.size = int(self.hls_bytes / self.seg_done * self.seg_total) if self.seg_done else 0
+        todo, lock, errors = [i for i, f in enumerate(files) if not os.path.exists(f)], threading.Lock(), []
+
+        def worker():
+            while not self._stop.is_set() and not errors:
+                with lock:
+                    if not todo:
+                        return
+                    i = todo.pop(0)
+                for attempt in range(RETRIES + 1):
+                    if self._stop.is_set():
+                        return
+                    try:
+                        got = 0
+                        with self._open(urls[i]) as r, open(files[i] + ".tmp", "wb") as out:
+                            while data := r.read(CHUNK):
+                                LIMITER.consume(len(data))
+                                out.write(data)
+                                got += len(data)
+                                if self._stop.is_set():
+                                    return
+                        os.replace(files[i] + ".tmp", files[i])
+                        break
+                    except (OSError, urllib.error.URLError) as e:
+                        if attempt == RETRIES:
+                            errors.append(e)
+                            return
+                        self._stop.wait(min(2 ** attempt, 20))
+                with lock:
+                    self.seg_done += 1
+                    self.hls_bytes += got
+                    self.size = int(self.hls_bytes / self.seg_done * self.seg_total)
+
+        workers = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, self.max_segments))]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+        if self._stop.is_set():
+            return
+        if errors:
+            raise errors[0]
+        with open(self.path + ".part", "wb") as out:
+            for f in files:
+                with open(f, "rb") as src:
+                    shutil.copyfileobj(src, out, 1 << 20)
+        os.replace(self.path + ".part", self.path)
+        shutil.rmtree(work, ignore_errors=True)
+        self.size = os.path.getsize(self.path)
+        self.status = "done"
+        self.start_verify()
+
+    def _run_segments(self):
+        fd = os.open(self.path + ".part", os.O_RDWR | os.O_CREAT)
+        errors = []
+        try:
+            os.ftruncate(fd, self.size)
+            self._save_meta()
+            workers = [threading.Thread(target=self._segment, args=(fd, s, errors), daemon=True)
+                       for s in self.segs if s[2] <= s[1]]
+            for w in workers:
+                w.start()
+            while any(w.is_alive() for w in workers):
+                time.sleep(1)
+                self._save_meta()
+            for w in workers:
+                w.join()
+            self._save_meta()
+        finally:
+            os.close(fd)
+        if errors and not self._stop.is_set():
+            raise errors[0]
+
+    def _segment(self, fd, seg, errors):
+        failures = 0
+        while seg[2] <= seg[1] and not self._stop.is_set() and not errors:
+            try:
+                with self._open(self.url, seg[2], seg[1]) as r:
+                    if r.status != 206:
+                        raise OSError(f"server ignored Range request (HTTP {r.status})")
+                    while not self._stop.is_set():
+                        data = r.read(min(CHUNK, seg[1] + 1 - seg[2]))
+                        if not data:
+                            break
+                        LIMITER.consume(len(data))
+                        os.pwrite(fd, data, seg[2])
+                        seg[2] += len(data)
+                        failures = 0
+                        if seg[2] > seg[1]:
+                            break
+                if seg[2] <= seg[1] and not self._stop.is_set():
+                    raise OSError("connection closed early")
+            except (OSError, urllib.error.URLError) as e:
+                failures += 1
+                if failures > RETRIES or (isinstance(e, urllib.error.HTTPError) and e.code in FATAL_HTTP):
+                    errors.append(e)
+                    return
+                self._stop.wait(min(2 ** failures, 20))
+
+    def _run_stream(self):
+        with self._open(self.url) as r, open(self.path + ".part", "wb") as f:
+            while not self._stop.is_set():
+                data = r.read(CHUNK)
+                if not data:
+                    break
+                LIMITER.consume(len(data))
+                f.write(data)
+                self.streamed += len(data)
+        if not self.size:
+            self.size = self.streamed
+
+
+class Manager:
+    """Runs at most `parallel` downloads at once; the rest wait in the queue."""
+
+    def __init__(self, parallel=3):
+        self.parallel = parallel
+        self.items = []
+
+    def add(self, dl, start=True):
+        self.items.append(dl)
+        if start:
+            dl.status = "queued"
+        self.schedule()
+        return dl
+
+    def remove(self, dl):
+        dl.cancel(delete_files=dl.status != "done")
+        if dl in self.items:
+            self.items.remove(dl)
+        self.schedule()
+
+    def schedule(self):
+        running = sum(d.status == "downloading" for d in self.items)
+        for d in self.items:
+            if running >= self.parallel:
+                break
+            if d.status == "queued":
+                d.start()
+                running += 1
+
+    def save(self):
+        write_private(QUEUE_FILE, [d.to_dict() for d in self.items if d.status != "cancelled"])
+
+    def load(self):
+        try:
+            with open(QUEUE_FILE) as f:
+                self.items = [Download.from_dict(d) for d in json.load(f)]
+        except (OSError, ValueError, KeyError):
+            self.items = []
+
+
+def fmt_eta(s):
+    if s is None:
+        return ""
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}j {m}m" if h else f"{m}m {s}s" if m else f"{s}s"
+
+
+def status_text(d):
+    if d.status == "error":
+        return f"Gagal: {d.error}"
+    if d.status == "done":
+        mark = {"checking": " - memverifikasi checksum...", "ok": " - \u2713 checksum cocok",
+                "bad": " - \u2717 CHECKSUM TIDAK COCOK, file mungkin rusak"}.get(d.verify, "")
+        return f"Selesai - {human(d.size)}{mark}"
+    total = human(d.size) if d.size else "?"
+    base = f"{human(d.downloaded)} / {total}"
+    if d.status == "downloading":
+        eta = fmt_eta(d.eta)
+        return f"{base} - {human(d.speed, '/s')}" + (f" - sisa {eta}" if eta else "")
+    return {"queued": "Antri", "paused": "Jeda", "cancelled": "Dibatalkan"}[d.status] + f" - {base}"
+
+
+# ---------------------------------------------------------------- CLI
+def run_cli(urls, directory, segments, checksum=None):
+    items = [Download(u, directory, segments) for u in urls]
+    if checksum:
+        if len(items) != 1:
+            print("--checksum hanya untuk satu URL", file=sys.stderr)
+            return 2
+        try:
+            items[0].set_checksum(checksum)
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 2
+    mgr = Manager(parallel=len(items))
+    for d in items:
+        mgr.add(d)
+    try:
+        while any(d.status in ("queued", "downloading") for d in items):
+            for d in items:
+                d.tick()
+            line = " | ".join(f"{(d.name or d.url)[:28]} {d.fraction * 100:5.1f}% {human(d.speed, '/s')}" for d in items)
+            print("\r" + line[:shutil_width()].ljust(shutil_width()), end="", flush=True)
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        for d in items:
+            d.pause()
+        print("\nDijeda. Jalankan perintah yang sama untuk melanjutkan.")
+        return 130
+    while any(d.verify == "checking" for d in items):
+        time.sleep(0.2)
+    print()
+    ok = True
+    for d in items:
+        extra = {"ok": " [checksum cocok]", "bad": " [CHECKSUM TIDAK COCOK]"}.get(d.verify, "")
+        print(f"{'OK  ' if d.status == 'done' else 'GAGAL'} {d.path or d.url} {d.error}{extra}")
+        ok &= d.status == "done" and d.verify != "bad"
+    return 0 if ok else 1
+
+
+def shutil_width():
+    import shutil
+    return shutil.get_terminal_size((100, 20)).columns - 1
+
+
+# ---------------------------------------------------------------- GUI
+def start_bridge(on_add):
+    """Local endpoint the browser extension posts links to (127.0.0.1 only)."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _send(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self._send(200, {"app": "kilatdl"}) if self.path == "/ping" else self._send(404, {})
+
+        def do_POST(self):
+            # Web pages cannot forge these: the custom header forces a CORS preflight
+            # that we never approve, and only extensions send an extension Origin.
+            origin = self.headers.get("Origin", "")
+            if (self.path != "/add" or self.headers.get("X-KilatDL") != "1"
+                    or not origin.startswith(("chrome-extension://", "moz-extension://"))):
+                return self._send(403, {"error": "forbidden"})
+            try:
+                size = int(self.headers.get("Content-Length", 0))
+                body = json.loads(self.rfile.read(min(size, 1 << 16)))
+                url = body["url"]
+                if not isinstance(url, str) or not re.match(r"https?://", url):
+                    raise ValueError("bad url")
+                headers = {k: v for k, v in (body.get("headers") or {}).items()
+                           if k in ("Cookie", "Referer") and isinstance(v, str) and "\n" not in v and "\r" not in v}
+                name = body.get("name")
+                name = os.path.basename(re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", name)).strip(". ")[:120] if isinstance(name, str) else None
+                on_add(url, headers, name or None)
+            except (ValueError, KeyError, TypeError):
+                return self._send(400, {"error": "bad request"})
+            self._send(200, {"ok": True})
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", BRIDGE_PORT), Handler)
+    except OSError:
+        return None
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def run_gui(urls, background=False):
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import Gio, GLib, Gtk, Pango
+
+    def open_path(path):
+        try:
+            Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path), None)
+        except GLib.Error:
+            pass  # no handler for this file type
+
+    settings = load_settings()
+    mgr = Manager(settings["parallel"])
+    mgr.load()
+    LIMITER.rate = settings["limit_kbps"] * 1024
+
+    class Row(Gtk.Box):
+        def __init__(self, dl, win):
+            super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            self.dl, self.win = dl, win
+            for side in ("top", "bottom", "start", "end"):
+                getattr(self, f"set_margin_{side}")(8)
+            self.title = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.MIDDLE)
+            self.bar = Gtk.ProgressBar()
+            self.info = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+            self.info.add_css_class("dim-label")
+            btns = Gtk.Box(spacing=6)
+            self.toggle = Gtk.Button(label="Jeda")
+            self.toggle.connect("clicked", self.on_toggle)
+            self.open_btn = Gtk.Button(label="Buka file")
+            self.open_btn.connect("clicked", lambda *_: open_path(self.dl.path))
+            folder = Gtk.Button(label="Buka folder")
+            folder.connect("clicked", self.on_folder)
+            self.link_btn = Gtk.Button(label="Ganti link")
+            self.link_btn.set_tooltip_text("Link kedaluwarsa? Tempel link baru, progres tetap dilanjutkan")
+            self.link_btn.connect("clicked", self.on_link)
+            self.sum_btn = Gtk.Button(label="Checksum")
+            self.sum_btn.connect("clicked", self.on_checksum)
+            rm = Gtk.Button(label="Hapus")
+            rm.add_css_class("destructive-action")
+            rm.connect("clicked", self.on_remove)
+            for b in (self.toggle, self.open_btn, folder, self.link_btn, self.sum_btn, rm):
+                btns.append(b)
+            for w in (self.title, self.bar, self.info, btns):
+                self.append(w)
+            self.refresh()
+
+        def on_toggle(self, _):
+            d = self.dl
+            if d.status in ("downloading", "queued"):
+                d.pause()
+            elif d.status in ("paused", "error", "cancelled"):
+                d.status, d.notified = "queued", False
+            mgr.schedule()
+
+        def on_link(self, _):
+            d = self.dl
+            if d.status == "downloading":
+                d.pause()
+                d.join()
+
+            def apply(text, done):
+                def work():
+                    try:
+                        d.replace_url(text.strip())
+                        GLib.idle_add(done, None)
+                    except ValueError as e:
+                        GLib.idle_add(done, str(e))
+                threading.Thread(target=work, daemon=True).start()
+
+            self.win.prompt("Ganti link", "Tempel link baru untuk file ini (ukurannya harus sama):", "https://...", apply)
+
+        def on_checksum(self, _):
+            def apply(text, done):
+                try:
+                    self.dl.set_checksum(text)
+                    done(None)
+                except ValueError as e:
+                    done(str(e))
+
+            self.win.prompt("Checksum", "Tempel hash dari situs (MD5/SHA-1/SHA-256/SHA-512), kosongkan untuk menghapus:",
+                            "sha256:...", apply)
+
+        def on_folder(self, _):
+            Gtk.show_uri(self.win, GLib.filename_to_uri(self.dl.directory), 0)
+
+        def on_remove(self, _):
+            mgr.remove(self.dl)
+            self.win.rebuild()
+
+        def refresh(self):
+            d = self.dl
+            d.tick()
+            self.title.set_text(d.name or d.url)
+            self.bar.set_fraction(d.fraction if d.status != "done" else 1.0)
+            self.info.set_text(status_text(d))
+            self.toggle.set_label({"downloading": "Jeda", "queued": "Batal antri", "done": "Selesai"}.get(d.status, "Lanjut"))
+            self.toggle.set_sensitive(d.status != "done")
+            self.open_btn.set_visible(d.status == "done")
+            self.link_btn.set_visible(d.status in ("paused", "error", "cancelled", "queued") and not d.hls)
+            self.sum_btn.set_visible(d.status == "done" or d.checksum is not None or d.status == "downloading")
+
+    class Window(Gtk.ApplicationWindow):
+        def __init__(self, app):
+            super().__init__(application=app, title="KilatDL", default_width=620, default_height=520)
+            add = Gtk.Button(label="+ Tambah URL")
+            add.add_css_class("suggested-action")
+            add.connect("clicked", lambda *_: self.ask_url())
+            header = Gtk.HeaderBar()
+            header.pack_start(add)
+            self.folder_btn = Gtk.Button()
+            self.folder_btn.connect("clicked", lambda *_: self.pick_folder(self.set_default_dir))
+            self.show_default_dir()
+            header.pack_start(self.folder_btn)
+            quit_btn = Gtk.Button(label="Keluar")
+            quit_btn.connect("clicked", lambda *_: app.quit())
+            header.pack_end(quit_btn)
+            limit = Gtk.SpinButton.new_with_range(0, 1_000_000, 100)
+            limit.set_value(settings["limit_kbps"])
+            limit.set_tooltip_text("Batas kecepatan total dalam KB/s (0 = tanpa batas)")
+            limit.connect("value-changed", self.on_limit)
+            header.pack_end(limit)
+            header.pack_end(Gtk.Label(label="Batas KB/s"))
+            self.set_titlebar(header)
+            self.connect("close-request", lambda *_: (self.set_visible(False), True)[1])
+            self.list = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.empty = Gtk.Label(label="Belum ada unduhan.\nKlik '+ Tambah URL' atau tempel tautan.", justify=Gtk.Justification.CENTER)
+            self.empty.set_vexpand(True)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            box.append(self.empty)
+            scroll = Gtk.ScrolledWindow(vexpand=True)
+            scroll.set_child(self.list)
+            box.append(scroll)
+            self.set_child(box)
+            self.rows = {}
+            self.rebuild()
+            GLib.timeout_add(500, self.tick)
+
+        def show_default_dir(self):
+            self.folder_btn.set_label("Simpan ke: " + os.path.basename(settings["directory"].rstrip("/")) or "/")
+            self.folder_btn.set_tooltip_text(settings["directory"])
+
+        def set_default_dir(self, path):
+            settings["directory"] = path
+            save_settings(settings)
+            self.show_default_dir()
+
+        def on_limit(self, spin):
+            settings["limit_kbps"] = int(spin.get_value())
+            LIMITER.rate = settings["limit_kbps"] * 1024
+            save_settings(settings)
+
+        def pick_folder(self, callback, initial=None):
+            dialog = Gtk.FileDialog(title="Pilih folder tujuan")
+            dialog.set_initial_folder(Gio.File.new_for_path(initial or settings["directory"]))
+
+            def done(dlg, res):
+                try:
+                    callback(dlg.select_folder_finish(res).get_path())
+                except GLib.Error:
+                    pass  # dialog cancelled
+
+            dialog.select_folder(self, None, done)
+
+        def rebuild(self):
+            self.rows.clear()
+            child = self.list.get_first_child()
+            while child:
+                nxt = child.get_next_sibling()
+                self.list.remove(child)
+                child = nxt
+            for d in mgr.items:
+                row = Row(d, self)
+                self.rows[d] = row
+                self.list.append(row)
+                self.list.append(Gtk.Separator())
+            self.empty.set_visible(not mgr.items)
+            mgr.save()
+
+        def prompt(self, title, label, placeholder, apply):
+            """Small text-entry dialog. apply(text, done) must call done(None) on success or done(message)."""
+            dlg = Gtk.Window(title=title, transient_for=self, modal=True, default_width=460)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(12)
+            entry = Gtk.Entry(placeholder_text=placeholder, hexpand=True)
+            msg = Gtk.Label(xalign=0, wrap=True)
+            ok = Gtk.Button(label="OK")
+            ok.add_css_class("suggested-action")
+
+            def done(error):
+                ok.set_sensitive(True)
+                dlg.close() if error is None else msg.set_text(error)
+
+            def submit(*_):
+                ok.set_sensitive(False)
+                msg.set_text("")
+                apply(entry.get_text(), done)
+
+            entry.connect("activate", submit)
+            ok.connect("clicked", submit)
+            for w in (Gtk.Label(label=label, xalign=0, wrap=True), entry, msg, ok):
+                box.append(w)
+            dlg.set_child(box)
+            dlg.present()
+
+        def notify_finished(self):
+            app = self.get_application()
+            for d in mgr.items:
+                if d.notified:
+                    continue
+                finished = d.status == "done" and (not d.checksum or d.verify in ("ok", "bad"))
+                if not (finished or d.status == "error"):
+                    continue
+                d.notified = True
+                if d.status == "error":
+                    note = Gio.Notification.new("Unduhan gagal")
+                    note.set_body(f"{d.name or d.url}\n{d.error}")
+                    note.set_icon(Gio.ThemedIcon.new("dialog-error-symbolic"))
+                else:
+                    bad = d.verify == "bad"
+                    note = Gio.Notification.new("Checksum tidak cocok!" if bad else "Unduhan selesai")
+                    note.set_body(f"{d.name}\n{human(d.size)}" + (" - file mungkin rusak" if bad else ""))
+                    note.set_icon(Gio.ThemedIcon.new("dialog-warning-symbolic" if bad else "folder-download"))
+                    note.add_button_with_target("Buka file", "app.open-file", GLib.Variant("s", d.path))
+                    note.add_button_with_target("Buka folder", "app.open-folder", GLib.Variant("s", os.path.dirname(d.path)))
+                    note.set_default_action_and_target("app.open-folder", GLib.Variant("s", os.path.dirname(d.path)))
+                app.send_notification(f"kilatdl-{id(d)}", note)
+
+        def tick(self):
+            self.notify_finished()
+            mgr.schedule()
+            for r in self.rows.values():
+                r.refresh()
+            mgr.save() if int(time.time()) % 5 == 0 else None
+            return True
+
+        def add_url(self, url, directory=None, headers=None, name=None, checksum=None):
+            url = url.strip()
+            if not re.match(r"https?://", url):
+                return False
+            dl = Download(url, directory or settings["directory"], name=name, headers=headers)
+            if checksum:
+                dl.set_checksum(checksum)
+            mgr.add(dl)
+            self.rebuild()
+            return True
+
+        def ask_url(self):
+            dlg = Gtk.Window(title="Tambah unduhan", transient_for=self, modal=True, default_width=460)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            for side in ("top", "bottom", "start", "end"):
+                getattr(box, f"set_margin_{side}")(12)
+            entry = Gtk.Entry(placeholder_text="https://contoh.com/file.zip", hexpand=True)
+            msg = Gtk.Label(xalign=0)
+            chosen = [settings["directory"]]
+            where = Gtk.Button(label="Folder: " + chosen[0])
+
+            def picked(path):
+                chosen[0] = path
+                where.set_label("Folder: " + path)
+
+            where.connect("clicked", lambda *_: self.pick_folder(picked, chosen[0]))
+            checksum = Gtk.Entry(placeholder_text="Checksum (opsional) sha256:... / md5 / sha1", hexpand=True)
+            ok = Gtk.Button(label="Unduh")
+            ok.add_css_class("suggested-action")
+
+            def submit(*_):
+                try:
+                    if checksum.get_text().strip():
+                        parse_checksum(checksum.get_text())
+                except ValueError as e:
+                    msg.set_text(str(e))
+                    return
+                if self.add_url(entry.get_text(), chosen[0], checksum=checksum.get_text()):
+                    dlg.close()
+                else:
+                    msg.set_text("URL harus diawali http:// atau https://")
+
+            entry.connect("activate", submit)
+            checksum.connect("activate", submit)
+            ok.connect("clicked", submit)
+            for w in (Gtk.Label(label="Tempel URL file:", xalign=0), entry, where, checksum, msg, ok):
+                box.append(w)
+            dlg.set_child(box)
+
+            def got(clip, res):
+                try:
+                    text = clip.read_text_finish(res) or ""
+                    if re.match(r"https?://", text.strip()) and not entry.get_text():
+                        entry.set_text(text.strip())
+                except GLib.Error:
+                    pass
+
+            self.get_clipboard().read_text_async(None, got)
+            dlg.present()
+
+    class App(Gtk.Application):
+        def __init__(self):
+            super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+            self.win = None
+            for name in ("open-file", "open-folder"):
+                act = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
+                act.connect("activate", lambda _a, param: open_path(param.get_string()))
+                self.add_action(act)
+
+        def do_command_line(self, cmd):
+            args = cmd.get_arguments()[1:]
+            if not self.win:
+                self.win = Window(self)
+                self.hold()  # keep running (downloads + browser bridge) when the window is closed
+                start_bridge(lambda url, headers, name: GLib.idle_add(lambda: self.win.add_url(url, None, headers, name) and False))
+            quiet = "--background" in args
+            for a in args:
+                if a != "--background":
+                    self.win.add_url(a)
+            if not quiet or any(a != "--background" for a in args):
+                self.win.present()
+            return 0
+
+        def do_shutdown(self):
+            for d in mgr.items:
+                d.pause()
+            mgr.save()
+            Gtk.Application.do_shutdown(self)
+
+    app = App()
+    return app.run([sys.argv[0]] + (["--background"] if background else []) + urls)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="kilatdl", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("urls", nargs="*")
+    p.add_argument("-o", "--output", default=default_dir(), help="folder tujuan (mode terminal)")
+    p.add_argument("-n", "--segments", type=int, default=8, help="jumlah koneksi per file (default 8)")
+    p.add_argument("--checksum", help="hash yang harus cocok, mis. sha256:ab12... (satu URL, mode terminal)")
+    p.add_argument("--gui", action="store_true", help="paksa buka GUI")
+    p.add_argument("--background", action="store_true", help="jalan tanpa membuka jendela (untuk autostart)")
+    a = p.parse_args()
+    if a.gui or a.background or not a.urls:
+        return run_gui(a.urls, a.background)
+    return run_cli(a.urls, a.output, max(1, a.segments), a.checksum)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

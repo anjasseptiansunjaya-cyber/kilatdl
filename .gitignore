@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+signed/
+*.xpi
+*.part
+*.kdl
+node_modules/
