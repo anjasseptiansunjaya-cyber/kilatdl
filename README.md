@@ -1,7 +1,7 @@
 # KilatDL
 
-Download manager multi-koneksi untuk Linux, dengan jendela GTK4, mode terminal, ekstensi Firefox,
-dan browser kecil bernama KilatBrowser. Dibuat sebagai pengganti Internet Download Manager.
+Download manager multi-koneksi untuk Linux, dengan jendela GTK4, mode terminal, dan ekstensi Firefox.
+Dibuat sebagai pengganti Internet Download Manager.
 
 ## Fitur
 
@@ -21,10 +21,10 @@ dan browser kecil bernama KilatBrowser. Dibuat sebagai pengganti Internet Downlo
 ./install.sh
 ```
 
-Memasang `kilatdl` dan `kilatbrowser` ke `~/.local/bin`, entri menu aplikasi, dan autostart
+Memasang `kilatdl` ke `~/.local/bin`, entri menu aplikasi, dan autostart
 (`~/.config/autostart/kilatdl.desktop`; hapus file itu untuk mematikannya). Tidak memerlukan sudo.
 
-Kebutuhan: Python 3.10+, PyGObject dengan GTK 4 dan libadwaita 1 (jendela), WebKit2GTK 4.1 (hanya KilatBrowser).
+Kebutuhan: Python 3.10+, PyGObject dengan GTK 4 dan libadwaita 1 (jendela).
 
 ## Pakai
 
