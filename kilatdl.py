@@ -66,8 +66,61 @@ class Limiter:
 LIMITER = Limiter()
 
 
+AFTER_ACTIONS = {"none": "Tidak ada", "quit": "Keluar dari KilatDL", "suspend": "Tidurkan komputer",
+                 "poweroff": "Matikan komputer"}
+HHMM = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+
+
+class Scheduler:
+    """Decides when queued downloads may start, and what to do once everything has finished.
+
+    With a start and stop time the window is [start, stop) and may wrap past midnight. With only a
+    start time the queue is released when that time is reached and stays released until it is empty.
+    """
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.released = False
+        self.last = None        # previous "HH:MM" seen, to detect the start time being crossed
+        self.busy = False
+        self.done_before = 0
+
+    def is_open(self, now, unfinished):
+        sc = self.settings["schedule"]
+        if not sc["enabled"] or not HHMM.fullmatch(sc["start"]):
+            self.last = now
+            return True
+        start, stop = sc["start"], sc["stop"]
+        if HHMM.fullmatch(stop or ""):
+            self.last = now
+            return start <= now < stop if start < stop else (now >= start or now < stop)
+        last, self.last = self.last, now
+        if last is not None and (last < start <= now or (now < last and (start > last or start <= now))):
+            self.released = True
+        if not unfinished:
+            self.released = False
+        return self.released
+
+    def finished_action(self, items):
+        """Returns the configured after-action once, when a batch of downloads has just completed."""
+        busy = any(d.status in ("downloading", "queued") for d in items)
+        done = sum(d.status == "done" for d in items)
+        if busy:
+            if not self.busy:
+                self.busy, self.done_before = True, done
+            return None
+        if not self.busy:
+            return None
+        self.busy = False
+        # a manual pause must never power the machine off
+        if done > self.done_before and not any(d.status == "paused" for d in items) and self.settings["after"] != "none":
+            return self.settings["after"]
+        return None
+
+
 def load_settings():
-    s = {"directory": default_dir(), "limit_kbps": 0, "parallel": 3}
+    s = {"directory": default_dir(), "limit_kbps": 0, "parallel": 3, "after": "none",
+         "schedule": {"enabled": False, "start": "23:00", "stop": ""}}
     try:
         with open(SETTINGS_FILE) as f:
             s.update(json.load(f))
@@ -75,6 +128,9 @@ def load_settings():
         pass
     if not os.path.isdir(s["directory"]):
         s["directory"] = default_dir()
+    s["schedule"] = {"enabled": False, "start": "23:00", "stop": "", **(s["schedule"] if isinstance(s["schedule"], dict) else {})}
+    if s["after"] not in AFTER_ACTIONS:
+        s["after"] = "none"
     return s
 
 
@@ -700,6 +756,7 @@ class Manager:
     def __init__(self, parallel=3):
         self.parallel = parallel
         self.items = []
+        self.hold = False   # True outside the scheduled window: nothing new may start
 
     def add(self, dl, start=True):
         self.items.append(dl)
@@ -715,6 +772,8 @@ class Manager:
         self.schedule()
 
     def schedule(self):
+        if self.hold:
+            return
         running = sum(d.status == "downloading" for d in self.items)
         for d in self.items:
             if running >= self.parallel:
@@ -754,6 +813,8 @@ def status_text(d):
     if d.status == "downloading":
         eta = fmt_eta(d.eta)
         return f"{base} - {human(d.speed, '/s')}" + (f" - sisa {eta}" if eta else "")
+    if d.status == "queued" and getattr(d, "held", False):
+        return f"Menunggu jadwal - {base}"
     return {"queued": "Antri", "paused": "Jeda", "cancelled": "Dibatalkan"}[d.status] + f" - {base}"
 
 
@@ -898,6 +959,7 @@ def run_gui(urls, background=False):
 
     settings = load_settings()
     mgr = Manager(settings["parallel"])
+    scheduler = Scheduler(settings)
     mgr.load()
     LIMITER.rate = settings["limit_kbps"] * 1024
 
@@ -1058,6 +1120,8 @@ def run_gui(urls, background=False):
             self.connect("close-request", lambda *_: (self.set_visible(False), True)[1])
             self.rebuild()
             GLib.timeout_add(500, self.tick)
+            if os.environ.get("KILATDL_TEST_DIALOG") == "schedule":  # test hook
+                GLib.timeout_add(800, lambda: self.ask_schedule() and False)
             if os.environ.get("KILATDL_SCREENSHOT"):  # test hook: render the window to a PNG, then quit
                 GLib.timeout_add(2500, self.snapshot)
 
@@ -1077,13 +1141,16 @@ def run_gui(urls, background=False):
             self.folder_btn = Gtk.Button()
             self.folder_btn.connect("clicked", lambda *_: self.pick_folder(self.set_default_dir))
             self.show_default_dir()
+            sched_btn = Gtk.Button(label="Jadwal & aksi akhir...")
+            sched_btn.connect("clicked", lambda *_: (self.menu_pop.popdown(), self.ask_schedule()))
             quit_btn = Gtk.Button(label="Keluar dari KilatDL")
             quit_btn.add_css_class("destructive-action")
             quit_btn.connect("clicked", lambda *_: app.quit())
             for w in (row, hint, Gtk.Separator(), Gtk.Label(label="Folder tujuan", xalign=0), self.folder_btn,
-                      Gtk.Separator(), quit_btn):
+                      Gtk.Separator(), sched_btn, Gtk.Separator(), quit_btn):
                 box.append(w)
-            return Gtk.Popover(child=box)
+            self.menu_pop = Gtk.Popover(child=box)
+            return self.menu_pop
 
         def show_default_dir(self):
             self.folder_btn.set_label(settings["directory"])
@@ -1140,7 +1207,17 @@ def run_gui(urls, background=False):
 
         def tick(self):
             self.notify_finished()
+            unfinished = any(d.status in ("downloading", "queued") for d in mgr.items)
+            mgr.hold = not scheduler.is_open(time.strftime("%H:%M"), unfinished)
+            for d in mgr.items:
+                d.held = mgr.hold
+                if mgr.hold and d.status == "downloading":
+                    d.pause()
+                    d.status = "queued"  # picked up again when the next window opens
             mgr.schedule()
+            action = scheduler.finished_action(mgr.items)
+            if action:
+                self.run_after(action)
             for r in self.rows.values():
                 r.refresh()
             self.stats.set_text(self.summary())
@@ -1160,6 +1237,86 @@ def run_gui(urls, background=False):
             if settings["limit_kbps"]:
                 parts.append(f"batas {settings['limit_kbps']} KB/s")
             return "  •  ".join(parts)
+
+        def run_after(self, action):
+            app = self.get_application()
+            if action == "quit":
+                app.quit()
+                return
+            command = ["systemctl", action]
+            label = AFTER_ACTIONS[action].lower()
+            dlg = Adw.AlertDialog(heading="Semua unduhan selesai", body="")
+            dlg.add_response("cancel", "Batal")
+            dlg.add_response("now", "Sekarang")
+            dlg.set_default_response("cancel")
+            left, cancelled = [30], [False]
+
+            def count():
+                if cancelled[0]:
+                    return False
+                if left[0] <= 0:
+                    dlg.close()
+                    subprocess.Popen(command, start_new_session=True)
+                    return False
+                dlg.set_body(f"Akan {label} dalam {left[0]} detik.")
+                left[0] -= 1
+                return True
+
+            GLib.timeout_add(1000, count)
+            count()
+
+            def answered(_d, response):
+                if response == "now" and not cancelled[0]:
+                    subprocess.Popen(command, start_new_session=True)
+                cancelled[0] = True
+
+            dlg.connect("response", answered)
+            dlg.present(self)
+            self.present()
+
+        def ask_schedule(self):
+            dlg = Adw.Dialog(title="Jadwal & aksi akhir", content_width=440)
+            sc = settings["schedule"]
+            group = Adw.PreferencesGroup(description="Unduhan antri hanya berjalan di dalam jendela waktu ini. "
+                                                     "Kosongkan 'Berhenti' agar berjalan sampai antrian habis.")
+            enabled = Adw.SwitchRow(title="Aktifkan jadwal", active=sc["enabled"])
+            start = Adw.EntryRow(title="Mulai (JJ:MM, 24 jam)", text=sc["start"])
+            stop = Adw.EntryRow(title="Berhenti (JJ:MM, opsional)", text=sc["stop"])
+            after = Adw.ComboRow(title="Setelah semua unduhan selesai", model=Gtk.StringList.new(list(AFTER_ACTIONS.values())))
+            after.set_selected(list(AFTER_ACTIONS).index(settings["after"]))
+            for row in (enabled, start, stop, after):
+                group.add(row)
+            msg = Gtk.Label(xalign=0, wrap=True)
+            msg.add_css_class("error")
+            ok = Gtk.Button(label="Simpan", halign=Gtk.Align.END)
+            ok.add_css_class("suggested-action")
+            ok.add_css_class("pill")
+
+            def save(*_):
+                st, sp = start.get_text().strip(), stop.get_text().strip()
+                if enabled.get_active() and not HHMM.fullmatch(st):
+                    msg.set_text("Jam mulai harus berformat JJ:MM, mis. 23:00")
+                    return
+                if sp and not HHMM.fullmatch(sp):
+                    msg.set_text("Jam berhenti harus berformat JJ:MM atau dikosongkan")
+                    return
+                settings["schedule"] = {"enabled": enabled.get_active(), "start": st or "23:00", "stop": sp}
+                settings["after"] = list(AFTER_ACTIONS)[after.get_selected()]
+                save_settings(settings)
+                scheduler.released = False
+                dlg.close()
+                self.toasts.add_toast(Adw.Toast.new("Jadwal disimpan"))
+
+            ok.connect("clicked", save)
+            body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_top=12, margin_bottom=16,
+                           margin_start=16, margin_end=16)
+            for w in (group, msg, ok):
+                body.append(w)
+            view = Adw.ToolbarView()
+            view.add_top_bar(Adw.HeaderBar())
+            view.set_content(body)
+            dlg.set_child(view)
+            dlg.present(self)
 
         def pause_all(self):
             for d in mgr.items:

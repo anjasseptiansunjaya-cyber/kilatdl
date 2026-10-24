@@ -42,6 +42,16 @@ Firefox Developer Edition/Nightly dapat memuatnya langsung dengan `xpinstall.sig
 Ekstensi bicara ke KilatDL lewat `127.0.0.1:9614`. Jalur itu hanya menerima permintaan dengan header
 `X-KilatDL` dan origin ekstensi, sehingga halaman web biasa tidak bisa menambah unduhan.
 
+## Tray, jadwal, dan aksi akhir
+
+- **Tray**: ikon petir di bilah atas (butuh ekstensi AppIndicator, sudah ada di Ubuntu). Klik untuk membuka
+  jendela; menu berisi jeda/lanjutkan semua, ringkasan status, dan Keluar.
+- **Jadwal** (menu ☰ → Jadwal & aksi akhir): unduhan antri hanya berjalan antara jam mulai dan berhenti
+  (boleh melewati tengah malam). Tanpa jam berhenti, antrian dilepas saat jam mulai tiba dan berjalan sampai habis.
+- **Aksi akhir**: setelah semua unduhan selesai, KilatDL bisa keluar, menidurkan, atau mematikan komputer.
+  Tidur/mati selalu menampilkan hitung mundur 30 detik yang bisa dibatalkan, dan tidak pernah berjalan
+  bila ada unduhan yang Anda jeda sendiri.
+
 ## Data
 
 `~/.local/share/kilatdl/` berisi `queue.json` (dapat memuat cookie sesi, izin 0600) dan `settings.json`.
